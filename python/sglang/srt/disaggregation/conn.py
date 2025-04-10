@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 from enum import Enum
-from typing import Optional
+from typing import Optional, Any
 
 import numpy as np
 import numpy.typing as npt
 import uuid
 import zmq
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -29,6 +30,99 @@ class KVArgs:
     ib_device: str
 
 
+class DecodeMemDescMsg:
+    room_number: int
+    kv_descs_serialized: bytes
+    aux_descs_serialized: bytes
+
+    def __init__(
+        self,
+        room_number: int,
+        kv_descs_serialized: bytes,
+        aux_descs_serialized: bytes,
+    ):
+        # type check.
+        assert isinstance(room_number, int)
+        assert isinstance(kv_descs_serialized, bytes)
+        assert isinstance(aux_descs_serialized, bytes)
+        
+        self.room_number = room_number
+        self.kv_descs_serialized = kv_descs_serialized
+        self.aux_descs_serialized = aux_descs_serialized
+
+    def serialize(self) -> bytes:
+        # layout:
+        # room_number, 8 bytes
+        # kv_descs_serialized_len, 4 bytes
+        # kv_descs_serialized, M bytes
+        # aux_desc_serialized_len, 4 bytes
+        # aux_desc_serialized, K bytes
+
+        return b"".join([
+            self.room_number.to_bytes(8, "little"),
+            len(self.kv_descs_serialized).to_bytes(4, "little"),
+            self.kv_descs_serialized,
+            len(self.aux_descs_serialized).to_bytes(4, "little"),
+            self.aux_descs_serialized,
+        ])
+
+    @staticmethod
+    def deserialize(data: bytes) -> DecodeMemDescMsg:
+        def read_int_4B(data: bytes, offset: int) -> tuple[int, int]:
+            return int.from_bytes(data[offset:offset+4], "little"), offset+4
+        def read_int_8B(data: bytes, offset: int) -> tuple[int, int]:
+            return int.from_bytes(data[offset:offset+8], "little"), offset+8
+        
+        offset = 0
+        room_number, offset = read_int_8B(data, offset)
+        kv_descs_serialized_len, offset = read_int_4B(data, offset)
+        kv_descs_serialized = data[offset:offset+kv_descs_serialized_len]
+        offset += kv_descs_serialized_len
+        aux_descs_serialized_len, offset = read_int_4B(data, offset)
+        aux_descs_serialized = data[offset:]
+        return DecodeMemDescMsg(room_number, kv_descs_serialized, aux_descs_serialized)
+        
+    
+    def send_to_memdesc_collector(self, addr: str):
+        # addr is host:port
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.PUSH)
+        sock.connect(f"tcp://{addr}")
+        sock.send(self.serialize())
+
+        sock.close()
+        ctx.term()
+
+    
+class MemDescCollector:
+    def __init__(self, port: int, deserializer): 
+        self.ctx = zmq.Context()
+        self.socket = self.ctx.socket(zmq.PULL)
+        self.socket.bind(f"tcp://*:{port}")
+        self.buffer = {} # room number -> (remote_kv_descs, remote_aux_descs)
+        self.deserializer = deserializer
+        pass
+
+    def recv_msgs(self):
+        while True:
+            try:
+                msg= self.socket.recv(flags=zmq.NOBLOCK)
+                msg = DecodeMemDescMsg.deserialize(msg)
+                logging.info(f'[wytdebug] memdesc collector recv {msg.room_number}, len(kv_descs): {len(msg.kv_descs_serialized)}, len(aux_descs): {len(msg.aux_descs_serialized)}')
+                assert self.buffer.get(msg.room_number) is None, f"Duplicate message for {msg.room_number}"
+                self.buffer[msg.room_number] = (
+                    self.deserializer(msg.kv_descs_serialized), 
+                    self.deserializer(msg.aux_descs_serialized)
+                )
+            except zmq.ZMQError:
+                break
+    
+    def try_fetch(self, room_number: int) -> tuple[Any, Any]:
+        if self.buffer.get(room_number) is None:
+            return (None, None)
+        logging.info(f'[wytdebug] memdesc collector pop out {room_number}')
+        return self.buffer[room_number]
+
 class KVManager:
     def __init__(self, args: KVArgs, mode: str):
         if mode not in ["prefill", "decode"]:
@@ -42,6 +136,7 @@ class KVManager:
         kv_addrs = []
         for data_ptr, data_len in zip(self.args.kv_data_ptrs, self.args.kv_data_lens):
             kv_addrs.append((data_ptr, data_len, self.args.engine_rank, ""))
+            # kv_addrs.append((tmp.data_ptr(), data_len, self.args.engine_rank, ""))
         self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM", is_sorted=True)
         if not self.kv_descs:
             raise Exception("NIXL memory registration failed for kv tensors")
@@ -53,10 +148,21 @@ class KVManager:
         # Create socket connection between decode/prefill
         self.ctx = zmq.Context()
         self.socket = self.ctx.socket(zmq.PAIR)
+
+        # TODO(wyt) For 1P1D we just let D connect P now, and exchange metadata immediately.
+        # Possible future design:
+        # we may have many P and Ds, 
+        # every P will have an unique addr and port to serve a boostrap server
+        # Once D recv a req, it will:
+        # 1. connect to the corresponding P bootstrap server
+        # 2. exchange metadata, such as room number, memory desc, etc.
+        # 3. poll and wait until kvcache is ready.
+
         if mode == "prefill":
-            self.socket.connect("tcp://127.0.0.1:8998")
-        elif mode == "decode":
             self.socket.bind("tcp://127.0.0.1:8998")
+            self.memdesc_collector = MemDescCollector(9000, self.agent.deserialize_descs)
+        elif mode == "decode":
+            self.socket.connect("tcp://127.0.0.1:8998")
 
         # Metadata exchange
         if mode == "prefill":
@@ -80,6 +186,10 @@ class KVPoll:
     Success = 4
 
 
+import torch
+tmp=torch.zeros(64 * 1024 * 1024, dtype=torch.int32, device="cpu").contiguous()
+
+
 class KVSender:
     def __init__(self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: int):
         """
@@ -90,24 +200,29 @@ class KVSender:
         self.mgr = mgr
         self.bootstrap_room = bootstrap_room
 
+        self.remote_kv_descs = None
+        self.remote_aux_descs = None
+
     def init(self, num_kv_indices: int, aux_index: Optional[int] = None):
         self.aux_index = aux_index
 
     def send(self, kv_indices: npt.NDArray[np.int32]):
+        assert self.remote_kv_descs is not None and self.remote_aux_descs is not None, "Have not received remote mem desc yet when try sending kv"
+
         # Get descs
-        remote_kv_descs = self.mgr.agent.deserialize_descs(self.mgr.socket.recv())
-        remote_aux_descs = self.mgr.agent.deserialize_descs(self.mgr.socket.recv())
         kv_addrs = []
         for data_ptr, item_len in zip(self.mgr.args.kv_data_ptrs, self.mgr.args.kv_item_lens):
             for i in kv_indices:
+                # kv_addrs.append((tmp.data_ptr(), item_len, self.mgr.args.engine_rank))
                 kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
         kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + self.aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
-        
+        logging.info(f"[wytdebug] KVSender: sending kv. self.bootstrap_room {self.bootstrap_room}") 
+
         # Send KV
         self.xfer_handle = self.mgr.agent.initialize_xfer(
-            "WRITE", kv_descs, remote_kv_descs, self.mgr.peer_name, str(self.bootstrap_room)
+            "WRITE", kv_descs, self.remote_kv_descs, self.mgr.peer_name, str(self.bootstrap_room)
         )
         if not self.xfer_handle:
             raise Exception("KVSender failed to create transfer")
@@ -116,7 +231,7 @@ class KVSender:
             raise Exception("KVSender failed to post transfer")
         # Send aux
         self.xfer_handle_aux = self.mgr.agent.initialize_xfer(
-            "WRITE", aux_descs, remote_aux_descs, self.mgr.peer_name, str(self.bootstrap_room) + "_aux"
+            "WRITE", aux_descs, self.remote_aux_descs, self.mgr.peer_name, str(self.bootstrap_room) + "_aux"
         )
         if not self.xfer_handle_aux:
             raise Exception("KVSender failed to create transfer")
@@ -126,15 +241,31 @@ class KVSender:
         self.has_sent = True
 
     def poll(self) -> KVPoll:
+        # TODO(wyt) We force recv remote mem desc first, and then forward. Actually they can take place in parallel.
+        # Consider multiple TP worker synchronization here!
+
+        if self.remote_kv_descs is None:
+            assert self.remote_aux_descs is None
+            # logging.info(f'[wytdebug] try fetch {self.mgr.peer_name} {self.bootstrap_room}')
+            self.remote_kv_descs, self.remote_aux_descs = \
+                self.mgr.memdesc_collector.try_fetch( self.bootstrap_room)
+        else:
+            assert self.remote_aux_descs is not None
+
+        if self.remote_kv_descs is None or self.remote_aux_descs is None:
+            return KVPoll.Bootstrapping
+
         if self.has_sent is False:
             return KVPoll.WaitingForInput
         state = self.mgr.agent.check_xfer_state(self.xfer_handle)
         state2 = self.mgr.agent.check_xfer_state(self.xfer_handle_aux)
         if state == "ERR" or state2 == "ERR":
             raise Exception("KVSender transfer encountered an error.")
-        if state == "DONE" and state2 == "DONE":
+        elif state == "DONE" and state2 == "DONE":
             return KVPoll.Success
-        return KVPoll.WaitingForInput
+        else:
+            # logging.info(f"[wytdebug] KVSender {self.bootstrap_room} poll result: {state}, {state2}")
+            return KVPoll.Transferring
 
     def failure_exception(self):
         raise Exception("Fake KVSender Exception")
@@ -142,11 +273,12 @@ class KVSender:
 
 class KVReceiver:
     def __init__(
-        self, mgr: KVManager, bootstrap_addr: str, bootstrap_room: Optional[int] = None
+        self, mgr: KVManager, memdesc_collector_addr: str, bootstrap_room: Optional[int] = None
     ):
         self.has_init = False
         self.mgr = mgr
-        self.bootstrap_room = bootstrap_room
+        self.memdesc_collector_addr = memdesc_collector_addr
+        self.bootstrap_room = bootstrap_room if bootstrap_room else 0
         self.kv_transfer_done = False
         self.aux_transfer_done = False
 
@@ -155,11 +287,25 @@ class KVReceiver:
         for data_ptr, item_len in zip(self.mgr.args.kv_data_ptrs, self.mgr.args.kv_item_lens):
             for i in kv_indices:
                 kv_addrs.append((data_ptr + i * item_len , item_len, self.mgr.args.engine_rank))
+                # kv_addrs.append((tmp.data_ptr() , item_len, self.mgr.args.engine_rank))
         kv_descs = self.mgr.agent.get_xfer_descs(kv_addrs, "VRAM", is_sorted=True)
         aux_addrs = [(self.mgr.args.aux_data_ptrs[0] + aux_index * self.mgr.args.aux_item_lens[0], self.mgr.args.aux_item_lens[0], 0)]
         aux_descs = self.mgr.agent.get_xfer_descs(aux_addrs, "DRAM", is_sorted=True)
-        self.mgr.socket.send(self.mgr.agent.get_serialized_descs(kv_descs))
-        self.mgr.socket.send(self.mgr.agent.get_serialized_descs(aux_descs))
+        logging.info(f'[wytdebug] KVReceiver: kv_descs: {kv_descs}, room: {self.bootstrap_room}')
+
+        # Once D recv a req, it will:
+        # 1. do preallocate 
+        # 2. connect the bootstrap server and send metadata, such as room number, memory desc, etc.
+        # 3. poll and wait until kvcache is ready.
+        
+        msg = DecodeMemDescMsg(
+            room_number=self.bootstrap_room if self.bootstrap_room else 0,
+            kv_descs_serialized=self.mgr.agent.get_serialized_descs(kv_descs),
+            aux_descs_serialized=self.mgr.agent.get_serialized_descs(aux_descs)
+        )
+        logging.info(f'[wytdebug] KVReceiver: sending to Prefill memdesc collector ({self.memdesc_collector_addr}): {msg.room_number}')
+        msg.send_to_memdesc_collector(self.memdesc_collector_addr)
+
         self.has_init = True
 
     def poll(self) -> KVPoll:

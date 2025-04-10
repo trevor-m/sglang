@@ -13,6 +13,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
+random.seed(0)
+cnt = 0
 
 class MiniLoadBalancer:
     def __init__(self, prefill_servers, decode_servers):
@@ -22,7 +24,7 @@ class MiniLoadBalancer:
     def select_pair(self):
         return random.choice(self.prefill_servers), random.choice(self.decode_servers)
 
-    async def generate_request(self, request_data):
+    async def notstream_generate_request(self, request_data):
         prefill_server, decode_server = self.select_pair()
 
         # Parse and transform prefill_server
@@ -31,18 +33,21 @@ class MiniLoadBalancer:
         bootstrap_host = f"{hostname}"
 
         modified_request = request_data.copy()
+
+        global cnt 
+        cnt += 1
         modified_request.update(
             {
                 "bootstrap_host": bootstrap_host,
-                "bootstrap_room": random.randint(0, 2**63 - 1),
+                "bootstrap_room": cnt
             }
         )
 
         async with aiohttp.ClientSession() as session:
             # Create the tasks
             tasks = [
-                session.post(f"{prefill_server}/generate", json=modified_request),
-                session.post(f"{decode_server}/generate", json=modified_request),
+                session.post(f"{prefill_server}/v1/chat/completions", json=modified_request),
+                session.post(f"{decode_server}/v1/chat/completions", json=modified_request),
             ]
 
             prefill_response = None
@@ -154,7 +159,7 @@ async def get_model_info():
     return ORJSONResponse(content=model_info)
 
 
-@app.post("/generate")
+@app.post("/v1/chat/completions")
 async def handle_generate_request(request_data: dict):
     prefill_server, decode_server = load_balancer.select_pair()
 
@@ -162,12 +167,18 @@ async def handle_generate_request(request_data: dict):
     parsed_url = urllib.parse.urlparse(prefill_server)
     hostname = parsed_url.hostname
     modified_request = request_data.copy()
+
+    global cnt 
+    cnt += 1
+
     modified_request.update(
         {
             "bootstrap_host": hostname,
-            "bootstrap_room": random.randint(0, 2**63 - 1),
+            "bootstrap_room": cnt,
         }
     )
+
+    print("[wytdebug] modified_request:", modified_request)
 
     # Check if streaming is requested
     if request_data.get("stream", False):
@@ -180,10 +191,10 @@ async def handle_generate_request(request_data: dict):
                     # Create the tasks
                     tasks = [
                         session.post(
-                            f"{prefill_server}/generate", json=modified_request
+                            f"{prefill_server}/v1/chat/completions", json=modified_request
                         ),
                         session.post(
-                            f"{decode_server}/generate", json=modified_request
+                            f"{decode_server}/v1/chat/completions", json=modified_request
                         ),
                     ]
 
@@ -239,7 +250,7 @@ async def handle_generate_request(request_data: dict):
         )
 
     # Non-streaming case
-    result = await load_balancer.generate_request(modified_request)
+    result = await load_balancer.notstream_generate_request(modified_request)
     return ORJSONResponse(content=result)
 
 

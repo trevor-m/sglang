@@ -94,11 +94,12 @@ class PrefillBootstrapQueue:
         kv_args.aux_item_lens = [
             metadata_buffer[0].nbytes for metadata_buffer in self.metadata_buffers
         ]
-        kv_args.ib_device = "mock-ib-device"
+        kv_args.ib_device = "mock"
         kv_manager = KVManager(kv_args, mode="prefill")
         return kv_manager
 
     def add(self, req: Req) -> None:
+        logging.info("[wytdebug] Bqueue enqueue. bootstrap_host: %s, bootstrap_port: %s, bootstrap_room: %s", req.bootstrap_host, self.bootstrap_port, req.bootstrap_room)
         req.disagg_kv_sender = KVSender(
             mgr=self.kv_manager,
             bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
@@ -115,6 +116,9 @@ class PrefillBootstrapQueue:
 
     def pop_bootstrapped(self) -> List[Req]:
         """pop the reqs which has finished bootstrapping"""
+
+        self.kv_manager.memdesc_collector.recv_msgs()
+
         bootstrapped_reqs = []
         indices_to_remove = set()
 
@@ -130,15 +134,14 @@ class PrefillBootstrapQueue:
                 continue
             elif poll == KVPoll.Failed:
                 raise Exception("Bootstrap failed")
+            logging.info(f"[wytdebug] bqueue poll result: {poll} bootstrap room: {req.bootstrap_room}, ")
 
             # KV.WaitingForInput - init here
             num_kv_indices = len(req.origin_input_ids)
             if self.req_to_metadata_buffer_idx_allocator.available_size() == 0:
+                logging.info(f"[wytdebug] pop_bootstrapped: no available metadata buffer index")
                 break
-
-            req.metadata_buffer_index = (
-                self.req_to_metadata_buffer_idx_allocator.alloc()
-            )
+            req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
             assert req.metadata_buffer_index is not None
             req.disagg_kv_sender.init(num_kv_indices, req.metadata_buffer_index)
 
@@ -148,7 +151,8 @@ class PrefillBootstrapQueue:
         self.queue = [
             entry for i, entry in enumerate(self.queue) if i not in indices_to_remove
         ]
-
+        if len(bootstrapped_reqs) > 0:
+            logging.info(f"[wytdebug] Bbqueue pop out: {len(bootstrapped_reqs)}")
         return bootstrapped_reqs
 
 
@@ -214,6 +218,11 @@ class SchedulerDisaggregationPrefillMixin:
         # Stream requests which have finished transfer
         self.stream_output(done_reqs, False, None)
 
+        for req in done_reqs:
+            self.disagg_prefill_pending_queue.req_to_metadata_buffer_idx_allocator.free(
+                req.metadata_buffer_index
+            )
+
         self.disagg_prefill_infight_queue = undone_reqs
 
     def process_prefill_chunk(self: Scheduler) -> None:
@@ -233,6 +242,8 @@ class SchedulerDisaggregationPrefillMixin:
     ) -> None:
         """
         Send a prefilled chunk to the decode server
+
+        token_id is the first output token.
         """
         start_idx = req.start_send_idx
         end_idx = min(len(req.fill_ids), len(req.origin_input_ids))
@@ -246,4 +257,5 @@ class SchedulerDisaggregationPrefillMixin:
             self.disagg_prefill_pending_queue.allocate_token_id(
                 req.metadata_buffer_index, token_id
             )
+        logging.info(f"[wytdebug] send_kv_chunk. Req room: {req.bootstrap_room} kv_indices: {kv_indices}")
         req.disagg_kv_sender.send(kv_indices)

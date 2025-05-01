@@ -6,6 +6,7 @@ import logging
 import queue
 import socket
 import struct
+import time
 import threading
 import uuid
 from collections import defaultdict
@@ -101,6 +102,9 @@ class NixlKVManager(BaseKVManager):
         self.rank_port = None
         self.server_socket = zmq.Context().socket(zmq.PULL)
         self.register_buffer_to_engine()
+
+        self.NOTIF_TIMES = {}
+        self.TRANSFER_INFO_TIME = {}
 
         self.rank_port = get_free_port()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -243,7 +247,8 @@ class NixlKVManager(BaseKVManager):
         peer_name = self._add_remote(bootstrap_room, req.agent_metadata)
         chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
         assert len(chunked_dst_kv_indice) == len(kv_indices)
-
+        self.agent.send_notif(peer_name, (str(req.room) + "_transferinforecv_" + str(self.TRANSFER_INFO_TIME[req.room])).encode("ascii"))
+        self.agent.send_notif(peer_name, (str(req.room) + "_computedone_" + str(time.time())).encode("ascii"))
         notif = "_".join([str(req.room), "kv", str(chunk_id), str(int(is_last))])
         kv_xfer_handle = self.send_kvcache(
             peer_name,
@@ -263,8 +268,9 @@ class NixlKVManager(BaseKVManager):
                 req.dst_aux_index,
                 str(req.room) + "_aux",
             )
+            self.agent.send_notif(peer_name, (str(req.room) + "_transferstarted_" + str(time.time())).encode("ascii"))
             handles.append(aux_xfer_handle)
-        return handles
+        return handles, peer_name
 
     def update_transfer_status(self):
         # Process notifications from received transfers.
@@ -284,6 +290,25 @@ class NixlKVManager(BaseKVManager):
                         self.transfer_statuses[room].num_kvs_expected = chunk_id + 1
                 elif components[1] == "aux":
                     self.transfer_statuses[room].received_aux = True
+                else:
+                    if room not in self.NOTIF_TIMES:
+                        self.NOTIF_TIMES[room] = {}
+                    sender_time = float(components[2])
+                    curr_time = time.time()
+                    self.NOTIF_TIMES[room][components[1]] = sender_time, curr_time
+                    logger.info(f"Room {room} {components[1]} sent at {sender_time} received at {curr_time}")
+                    if components[1] == "transferdone":
+                        transferinforecv1, _ = self.NOTIF_TIMES[room]["transferinforecv"]
+                        computedone1, computedone2 = self.NOTIF_TIMES[room]["computedone"]
+                        transferstarted1, transferstarted2 = self.NOTIF_TIMES[room]["transferstarted"]
+                        transferdone1, transferdone2 = self.NOTIF_TIMES[room]["transferdone"]
+                        elapsed0 = (computedone1 - transferinforecv1) * 1000.0
+                        elapsed1 = (transferstarted1 - computedone1) * 1000.0
+                        elapsed2 = (transferdone1 - transferstarted1) * 1000.0
+                        logger.info(f"Room {room} sender: info recv -> compute done: {elapsed0} ms, compute done -> transfer started: {elapsed1} ms, transfer started -> transfer done: {elapsed2} ms")
+                        elapsed1 = (transferstarted2 - computedone2) * 1000.0
+                        elapsed2 = (transferdone2 - transferstarted2) * 1000.0
+                        logger.info(f"Room {room} notif received: compute done -> transfer started: {elapsed1}, transfer started -> transfer done: {elapsed2}")
 
     def check_transfer_done(self, room: int):
         if room not in self.transfer_statuses:
@@ -331,6 +356,7 @@ class NixlKVManager(BaseKVManager):
                 room = int(room)
                 with self.condition:
                     self.transfer_infos[room] = TransferInfo.from_zmq(waiting_req_bytes)
+                    self.TRANSFER_INFO_TIME[room] = time.time()
                     self.condition.notify_all()
 
         threading.Thread(target=bootstrap_thread).start()
@@ -357,7 +383,7 @@ class NixlKVSender(BaseKVSender):
         index_slice: slice,
         is_last: bool,
     ):
-        new_xfer_handles = self.kv_mgr.add_transfer_request(
+        new_xfer_handles, self.peer_name = self.kv_mgr.add_transfer_request(
             self.bootstrap_room,
             kv_indices,
             index_slice,
@@ -367,6 +393,7 @@ class NixlKVSender(BaseKVSender):
         )
         self.xfer_handles.extend(new_xfer_handles)
         self.chunk_id += 1
+        self.sent_notif = False
         if is_last:
             self.has_sent = True
 
@@ -376,6 +403,9 @@ class NixlKVSender(BaseKVSender):
 
         states = [self.kv_mgr.agent.check_xfer_state(x) for x in self.xfer_handles]
         if all([x == "DONE" for x in states]):
+            if not self.sent_notif:
+                self.sent_notif = True
+                self.kv_mgr.agent.send_notif(self.peer_name, (str(self.bootstrap_room) + "_transferdone_" + str(time.time())).encode("ascii"))
             return KVPoll.Success
         if any([x == "ERR" for x in states]):
             raise Exception("KVSender transfer encountered an error.")
@@ -466,7 +496,9 @@ class NixlKVReceiver(BaseKVReceiver):
                 str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
             ]
         )
+        self.start_time = time.time()
         self.started_transfer = True
+        self.log_time = False
 
     def poll(self) -> KVPoll:
         if not self.started_transfer:
@@ -475,6 +507,9 @@ class NixlKVReceiver(BaseKVReceiver):
         self.kv_mgr.update_transfer_status()
 
         if self.kv_mgr.check_transfer_done(self.bootstrap_room):
+            if not self.log_time:
+                self.log_time = True
+                logger.info(f"Room {self.bootstrap_room} receiver sees transfer done at {time.time()}, elapsed time since sending info: {(time.time() - self.start_time) * 1000.0} ms")
             return KVPoll.Success
         return KVPoll.WaitingForInput
 

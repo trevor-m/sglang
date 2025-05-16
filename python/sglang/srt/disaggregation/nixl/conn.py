@@ -12,6 +12,7 @@ from collections import defaultdict
 from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, TypeAlias, Union
 
+import time
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -131,6 +132,9 @@ class NixlKVManager(CommonKVManager):
             self.transfer_infos: Dict[int, TransferInfo] = {}
             self.peer_names: Dict[str, str] = {}
             self._start_bootstrap_thread()
+            self.prep_handles = {}
+            # Enable "prepped" transfer API in nixl which improves transfer speed
+            self.use_prep = True
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
@@ -177,6 +181,29 @@ class NixlKVManager(CommonKVManager):
             self.peer_names[agent_name] = self.agent.add_remote_agent(agent_metadata)
         return self.peer_names[agent_name]
 
+    
+    def _get_prep_handle(self, peer_name: str, kv_ptrs: list[int], gpu_id: int):
+        if peer_name not in self.prep_handles:
+            start = time.time()
+            xfer_list = []
+            num_layers = len(self.kv_args.kv_data_ptrs)
+            for layer_id in range(num_layers):
+                item_len = self.kv_args.kv_item_lens[layer_id]
+                num_items = self.kv_args.kv_data_lens[layer_id] // item_len
+
+                base_ptr = kv_ptrs[layer_id]
+                ptrs = np.arange(num_items, dtype=np.int64) * item_len + base_ptr
+                lens = np.full(num_items, item_len, dtype=np.int32)
+                gpus = np.full(num_items, gpu_id, dtype=np.int32)
+                xfer_list.extend(zip(ptrs.tolist(), lens.tolist(), gpus.tolist()))
+            
+            logger.info(f"transfer: python prep time for prep_xfer_dlist: {(time.time() - start) * 1000} ms")
+            start = time.time()
+            self.prep_handles[peer_name] = self.agent.prep_xfer_dlist(peer_name, xfer_list, "VRAM")
+            assert self.prep_handles[peer_name] != 0
+            logger.info(f"transfer: prep_xfer_dlist(): {(time.time() - start) * 1000} ms")
+        return self.prep_handles[peer_name]
+
     def send_kvcache(
         self,
         peer_name: str,
@@ -186,44 +213,64 @@ class NixlKVManager(CommonKVManager):
         dst_gpu_id: int,
         notif: str,
     ):
-        # group by indices
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_kv_indices, dst_kv_indices
-        )
+        logger.info(f"sending kvcache to {peer_name} with notif {notif}. send {len(prefill_kv_indices)} tokens")
+        if self.use_prep:
+            src_prep_handle = self._get_prep_handle("NIXL_INIT_AGENT", self.kv_args.kv_data_ptrs, self.kv_args.gpu_id)
+            dst_prep_handle = self._get_prep_handle(peer_name, dst_kv_ptrs, dst_gpu_id)
+            start = time.time()
+            xfer_handle = self.agent.make_prepped_xfer(
+                "WRITE", src_prep_handle, prefill_kv_indices, dst_prep_handle, dst_kv_indices, notif.encode("ascii")
+            )
+            logger.info(f"transfer: make_prepped_xfer(): {(time.time() - start) * 1000} ms")
+        else:
+            # group by indices
+            start = time.time()
+            prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
+                prefill_kv_indices, dst_kv_indices
+            )
 
-        logger.debug(f"sending kvcache to {peer_name} with notif {notif}")
-        # Make descs
-        num_layers = len(self.kv_args.kv_data_ptrs)
-        src_addrs = []
-        dst_addrs = []
-        for layer_id in range(num_layers):
-            src_ptr = self.kv_args.kv_data_ptrs[layer_id]
-            dst_ptr = dst_kv_ptrs[layer_id]
-            item_len = self.kv_args.kv_item_lens[layer_id]
+            # Make descs
+            num_layers = len(self.kv_args.kv_data_ptrs)
+            src_addrs = []
+            dst_addrs = []
+            for layer_id in range(num_layers):
+                src_ptr = self.kv_args.kv_data_ptrs[layer_id]
+                dst_ptr = dst_kv_ptrs[layer_id]
+                item_len = self.kv_args.kv_item_lens[layer_id]
 
-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                src_addrs.append((src_addr, length, self.kv_args.gpu_id))
-                dst_addrs.append((dst_addr, length, dst_gpu_id))
+                for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
+                    src_addr = src_ptr + int(prefill_index[0]) * item_len
+                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                    length = item_len * len(prefill_index)
+                    #logger.info(f"length: {length}")
+                    src_addrs.append((src_addr, length, self.kv_args.gpu_id))
+                    dst_addrs.append((dst_addr, length, dst_gpu_id))
 
-        logger.debug(
-            f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
-        )
-        src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM", is_sorted=True)
-        dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM", is_sorted=True)
-        # Transfer data
-        xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
-            src_descs,
-            dst_descs,
-            peer_name,
-            notif.encode("ascii"),  # type: ignore
-        )
+            logger.info(
+                f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
+            )
+            logger.info(f"transfer: python prep time: {(time.time() - start) * 1000} ms")
+            start = time.time()
+            src_descs = self.agent.get_xfer_descs(src_addrs, "VRAM", is_sorted=True)
+            dst_descs = self.agent.get_xfer_descs(dst_addrs, "VRAM", is_sorted=True)
+            
+            logger.info(f"transfer: get_xfer_descs: {(time.time() - start) * 1000} ms")
+            start = time.time()
+            # Transfer data
+            xfer_handle = self.agent.initialize_xfer(
+                "WRITE",
+                src_descs,
+                dst_descs,
+                peer_name,
+                notif.encode("ascii"),  # type: ignore
+            )
+            logger.info(f"transfer: initialize_xfer: {(time.time() - start) * 1000} ms")
+
+        start = time.time()
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
         state = self.agent.transfer(xfer_handle)
+        logger.info(f"transfer: transfer(): {(time.time() - start) * 1000} ms")
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle

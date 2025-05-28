@@ -37,20 +37,18 @@ logger = logging.getLogger(__name__)
 NixlEngineInfo: TypeAlias = Dict[str, Union[str, int]]
 
 GUARD = "NixlMsgGuard".encode("ascii")
+NIXL_INIT_AGENT = "NIXL_INIT_AGENT"
 
 
+# prefill
 @dataclasses.dataclass
 class TransferInfo:
     room: int
     endpoint: str
     dst_port: int
-    agent_metadata: bytes
     agent_name: str
-    dst_kv_ptrs: list[int]
     dst_kv_indices: npt.NDArray[np.int64]
-    dst_aux_ptrs: list[int]
     dst_aux_index: int
-    dst_gpu_id: int
     required_dst_info_num: int
 
     def is_dummy(self):
@@ -64,13 +62,9 @@ class TransferInfo:
                 room=int(msg[0].decode("ascii")),
                 endpoint="",
                 dst_port=0,
-                agent_metadata=b"",
                 agent_name="",
-                dst_kv_ptrs=[],
                 dst_kv_indices=np.array([], dtype=np.int64),
-                dst_aux_ptrs=[],
                 dst_aux_index=0,
-                dst_gpu_id=0,
                 required_dst_info_num=0,
             )
         else:
@@ -78,17 +72,40 @@ class TransferInfo:
                 room=int(msg[0].decode("ascii")),
                 endpoint=msg[1].decode("ascii"),
                 dst_port=int(msg[2].decode("ascii")),
-                agent_metadata=msg[3],
-                agent_name=msg[4].decode("ascii"),
-                dst_kv_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
-                dst_kv_indices=np.frombuffer(msg[6], dtype=np.int64),
-                dst_aux_ptrs=list(struct.unpack(f"{len(msg[7])//8}Q", msg[7])),
-                dst_aux_index=int(msg[8].decode("ascii")),
-                dst_gpu_id=int(msg[9].decode("ascii")),
-                required_dst_info_num=int(msg[10].decode("ascii")),
+                agent_name=msg[3].decode("ascii"),
+                dst_kv_indices=np.frombuffer(msg[4], dtype=np.int64),
+                dst_aux_index=int(msg[5].decode("ascii")),
+                required_dst_info_num=int(msg[6].decode("ascii")),
             )
 
 
+# decode
+@dataclasses.dataclass
+class KVArgsRegisterInfo:
+    room: str
+    endpoint: str
+    dst_port: int
+    agent_name: str
+    agent_metadata: str
+    dst_kv_ptrs: list[int]
+    dst_aux_ptrs: list[int]
+    gpu_id: int
+
+    @classmethod
+    def from_zmq(cls, msg: List[bytes]):
+        return cls(
+            room=str(msg[0].decode("ascii")),
+            endpoint=msg[1].decode("ascii"),
+            dst_port=int(msg[2].decode("ascii")),
+            agent_name=msg[3].decode("ascii"),
+            agent_metadata=msg[4],
+            dst_kv_ptrs=list(struct.unpack(f"{len(msg[5])//8}Q", msg[5])),
+            dst_aux_ptrs=list(struct.unpack(f"{len(msg[6])//8}Q", msg[6])),
+            gpu_id=int(msg[7].decode("ascii")),
+        )
+
+
+# decode
 @dataclasses.dataclass
 class TransferStatus:
     """Used by KV Receiver to know when a transfer is done."""
@@ -105,6 +122,15 @@ class TransferStatus:
             return False
         return self.num_kvs_expected == len(self.received_kvs) and self.received_aux
 
+
+def repeat_indices_over_layers(indices: npt.NDArray[np.int64], layer_lengths: List[int]) -> npt.NDArray[np.int64]:
+    offsets = np.cumsum([0] + layer_lengths[:-1])
+    repeated = np.tile(indices, len(layer_lengths))
+    # Repeat the offsets for each block of indices
+    offset_repeated = np.repeat(offsets, len(indices))
+    # Add the offsets to the indices
+    adjusted_indices = repeated + offset_repeated
+    return adjusted_indices.astype(np.int64)
 
 class NixlKVManager(CommonKVManager):
     def __init__(
@@ -129,12 +155,16 @@ class NixlKVManager(CommonKVManager):
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.request_status = {}
-            self.transfer_infos: Dict[int, TransferInfo] = {}
-            self.peer_names: Dict[str, str] = {}
+            self.transfer_infos: Dict[int, Dict[str, TransferInfo]] = {}
+            # TODO: pop transfer infos
+            self.decode_kv_args_table: Dict[str, KVArgsRegisterInfo] = {}
             self._start_bootstrap_thread()
-            self.prep_handles = {}
             # Enable "prepped" transfer API in nixl which improves transfer speed
-            self.use_prep = True
+            self.use_prepped_transfer = True
+            # Peer name -> opaque nixl_prepped_dlist_handle
+            self.prep_handles: Dict[str, int] = {}
+            if self.use_prepped_transfer:
+                self._init_prep_handle(NIXL_INIT_AGENT, self.kv_args.kv_data_ptrs, self.kv_args.gpu_id)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             self.transfer_statuses: Dict[int, TransferStatus] = defaultdict(
                 TransferStatus
@@ -176,33 +206,36 @@ class NixlKVManager(CommonKVManager):
         if not self.aux_descs:
             raise Exception("NIXL memory registration failed for aux tensors")
 
-    def _add_remote(self, agent_name: str, agent_metadata: bytes):
-        if agent_name not in self.peer_names:
-            self.peer_names[agent_name] = self.agent.add_remote_agent(agent_metadata)
-        return self.peer_names[agent_name]
-
+    def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
+        agent_name = decode_kv_args.agent_name
+        if agent_name in self.decode_kv_args_table:
+            logger.debug(f"Peer {agent_name} was already registered, ignoring.")
+            return
+        self.decode_kv_args_table[agent_name] = decode_kv_args
+        self.agent.add_remote_agent(decode_kv_args.agent_metadata)
+        if self.use_prepped_transfer:
+            self._init_prep_handle(agent_name, decode_kv_args.dst_kv_ptrs, decode_kv_args.gpu_id)
     
-    def _get_prep_handle(self, peer_name: str, kv_ptrs: list[int], gpu_id: int):
-        if peer_name not in self.prep_handles:
-            start = time.time()
-            xfer_list = []
-            num_layers = len(self.kv_args.kv_data_ptrs)
-            for layer_id in range(num_layers):
-                item_len = self.kv_args.kv_item_lens[layer_id]
-                num_items = self.kv_args.kv_data_lens[layer_id] // item_len
-
-                base_ptr = kv_ptrs[layer_id]
-                ptrs = np.arange(num_items, dtype=np.int64) * item_len + base_ptr
-                lens = np.full(num_items, item_len, dtype=np.int32)
-                gpus = np.full(num_items, gpu_id, dtype=np.int32)
-                xfer_list.extend(zip(ptrs.tolist(), lens.tolist(), gpus.tolist()))
-            
-            logger.info(f"transfer: python prep time for prep_xfer_dlist: {(time.time() - start) * 1000} ms")
-            start = time.time()
-            self.prep_handles[peer_name] = self.agent.prep_xfer_dlist(peer_name, xfer_list, "VRAM")
-            assert self.prep_handles[peer_name] != 0
-            logger.info(f"transfer: prep_xfer_dlist(): {(time.time() - start) * 1000} ms")
-        return self.prep_handles[peer_name]
+    def _init_prep_handle(self, peer_name: str, kv_ptrs: list[int], gpu_id: int):
+        start = time.time()
+        xfer_list = []
+        assert len(kv_ptrs) == len(self.kv_args.kv_data_ptrs)
+        num_layers = len(self.kv_args.kv_data_ptrs)
+        for layer_id in range(num_layers):
+            item_len = self.kv_args.kv_item_lens[layer_id]
+            num_items = self.kv_args.kv_data_lens[layer_id] // item_len
+            logger.debug(f"{layer_id=} {item_len=} {num_items=}")
+            base_ptr = kv_ptrs[layer_id]
+            ptrs = np.arange(num_items, dtype=np.int64) * item_len + base_ptr
+            lens = np.full(num_items, item_len, dtype=np.int32)
+            gpus = np.full(num_items, gpu_id, dtype=np.int32)
+            xfer_list.extend(zip(ptrs.tolist(), lens.tolist(), gpus.tolist()))
+        
+        logger.debug(f"python prep time for prep_xfer_dlist: {(time.time() - start) * 1000} ms, len={len(xfer_list)}")
+        start = time.time()
+        self.prep_handles[peer_name] = self.agent.prep_xfer_dlist(peer_name, xfer_list, "VRAM")
+        assert self.prep_handles[peer_name] != 0
+        logger.debug(f"time for prep_xfer_dlist(): {(time.time() - start) * 1000} ms")
 
     def send_kvcache(
         self,
@@ -214,9 +247,14 @@ class NixlKVManager(CommonKVManager):
         notif: str,
     ):
         logger.info(f"sending kvcache to {peer_name} with notif {notif}. send {len(prefill_kv_indices)} tokens")
-        if self.use_prep:
-            src_prep_handle = self._get_prep_handle("NIXL_INIT_AGENT", self.kv_args.kv_data_ptrs, self.kv_args.gpu_id)
-            dst_prep_handle = self._get_prep_handle(peer_name, dst_kv_ptrs, dst_gpu_id)
+        if self.use_prepped_transfer:
+            src_prep_handle = self.prep_handles[NIXL_INIT_AGENT]
+            dst_prep_handle = self.prep_handles[peer_name]
+            start = time.time()
+            layer_lengths = [self.kv_args.kv_data_lens[i] // self.kv_args.kv_item_lens[i] for i in range(len(self.kv_args.kv_item_lens))]
+            prefill_kv_indices = repeat_indices_over_layers(prefill_kv_indices, layer_lengths)
+            dst_kv_indices = repeat_indices_over_layers(dst_kv_indices, layer_lengths)
+            logger.info(f"transfer: repeat_indices_over_layers(): {(time.time() - start) * 1000} ms")
             start = time.time()
             xfer_handle = self.agent.make_prepped_xfer(
                 "WRITE", src_prep_handle, prefill_kv_indices, dst_prep_handle, dst_kv_indices, notif.encode("ascii")
@@ -327,17 +365,16 @@ class NixlKVManager(CommonKVManager):
             if req.is_dummy():
                 return []
 
-            peer_name = self._add_remote(req.agent_name, req.agent_metadata)
             chunked_dst_kv_indice = req.dst_kv_indices[index_slice]
             assert len(chunked_dst_kv_indice) == len(kv_indices)
 
             notif = "_".join([str(req.room), "kv", str(chunk_id), str(int(is_last))])
             kv_xfer_handle = self.send_kvcache(
-                peer_name,
+                req.agent_name,
                 kv_indices,
-                req.dst_kv_ptrs,
+                self.decode_kv_args_table[req.agent_name].dst_kv_ptrs,
                 chunked_dst_kv_indice,
-                req.dst_gpu_id,
+                self.decode_kv_args_table[req.agent_name].gpu_id,
                 notif,
             )
             handles.append(kv_xfer_handle)
@@ -345,9 +382,9 @@ class NixlKVManager(CommonKVManager):
             if is_last:
                 assert aux_index is not None
                 aux_xfer_handle = self.send_aux(
-                    peer_name,
+                    req.agent_name,
                     aux_index,
-                    req.dst_aux_ptrs,
+                    self.decode_kv_args_table[req.agent_name].dst_aux_ptrs,
                     req.dst_aux_index,
                     str(req.room) + "_aux",
                 )
@@ -393,17 +430,20 @@ class NixlKVManager(CommonKVManager):
                 ), f"First message should be {GUARD}. Foreign traffic?"
                 waiting_req_bytes = waiting_req_bytes[1:]
                 room = waiting_req_bytes[0].decode("ascii")
+                agent_name = waiting_req_bytes[3].decode("ascii")
                 if room == "None":
+                    self._add_remote_peer(KVArgsRegisterInfo.from_zmq(waiting_req_bytes))
+                    logger.debug(
+                        f"Register KVArgs from {agent_name} successfully"
+                    )
                     continue
-                required_dst_info_num = int(waiting_req_bytes[10].decode("ascii"))
                 room = int(room)
-                agent_name = waiting_req_bytes[4].decode("ascii")
                 if room not in self.transfer_infos:
                     self.transfer_infos[room] = {}
                 self.transfer_infos[room][agent_name] = TransferInfo.from_zmq(
                     waiting_req_bytes
                 )
-
+                required_dst_info_num = self.transfer_infos[room][agent_name].required_dst_info_num
                 logger.debug(f"got info {room=} {agent_name=} {required_dst_info_num=}")
                 if len(self.transfer_infos[room]) == required_dst_info_num:
                     logger.debug(f"{room=} is bootstrapped")
@@ -498,14 +538,6 @@ class NixlKVReceiver(CommonKVReceiver):
                     )
                 continue
 
-            # TODO: send_kv_args earlier
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
-            packed_aux_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
-            )
-
             logger.debug(
                 f"Sending to {self.prefill_server_url} with bootstrap room {self.bootstrap_room}"
             )
@@ -517,13 +549,9 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.bootstrap_room).encode("ascii"),
                         get_local_ip_by_remote().encode("ascii"),
                         str(self.kv_mgr.rank_port).encode("ascii"),
-                        self.kv_mgr.agent.get_agent_metadata(),
                         self.kv_mgr.agent.name.encode("ascii"),
-                        packed_kv_data_ptrs,
                         kv_indices.tobytes(),
-                        packed_aux_data_ptrs,
                         str(aux_index).encode("ascii"),
-                        str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
                         str(self.required_dst_info_num).encode("ascii"),
                     ]
                 )
@@ -541,7 +569,32 @@ class NixlKVReceiver(CommonKVReceiver):
         return KVPoll.WaitingForInput  # type: ignore
 
     def _register_kv_args(self):
-        pass
+        for bootstrap_info in self.bootstrap_infos:
+            self.prefill_server_url = (
+                f"{bootstrap_info['rank_ip']}:{bootstrap_info['rank_port']}"
+            )
+            packed_kv_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
+            )
+            packed_aux_data_ptrs = b"".join(
+                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
+            )
+
+            sock, lock = self._connect("tcp://" + self.prefill_server_url)
+            with lock:
+                sock.send_multipart(
+                    [
+                        GUARD,
+                        "None".encode("ascii"),
+                        get_local_ip_by_remote().encode("ascii"),
+                        str(self.kv_mgr.rank_port).encode("ascii"),
+                        self.kv_mgr.agent.name.encode("ascii"),
+                        self.kv_mgr.agent.get_agent_metadata(),
+                        packed_kv_data_ptrs,
+                        packed_aux_data_ptrs,
+                        str(self.kv_mgr.kv_args.gpu_id).encode("ascii"),
+                    ]
+                )
 
     def failure_exception(self):
         raise Exception("Fake KVReceiver Exception")

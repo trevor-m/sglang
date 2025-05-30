@@ -12,6 +12,7 @@ from collections import defaultdict
 from functools import cache
 from typing import Dict, List, Optional, Set, Tuple, TypeAlias, Union
 
+import time
 import numpy as np
 import numpy.typing as npt
 import requests
@@ -202,6 +203,7 @@ class NixlKVManager(CommonKVManager):
         num_layers = len(self.kv_args.kv_data_ptrs)
         src_addrs = []
         dst_addrs = []
+        total_length = 0
         for layer_id in range(num_layers):
             src_ptr = self.kv_args.kv_data_ptrs[layer_id]
             dst_ptr = dst_kv_ptrs[layer_id]
@@ -211,6 +213,7 @@ class NixlKVManager(CommonKVManager):
                 src_addr = src_ptr + int(prefill_index[0]) * item_len
                 dst_addr = dst_ptr + int(decode_index[0]) * item_len
                 length = item_len * len(prefill_index)
+                total_length += length
                 src_addrs.append((src_addr, length, self.kv_args.gpu_id))
                 dst_addrs.append((dst_addr, length, dst_gpu_id))
 
@@ -229,7 +232,9 @@ class NixlKVManager(CommonKVManager):
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
+        start = time.time()
         state = self.agent.transfer(xfer_handle)
+        logger.info(f"agent.transfer() time={(time.time() - start) * 1000} ms for {total_length} bytes to {peer_name}")
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
         return xfer_handle

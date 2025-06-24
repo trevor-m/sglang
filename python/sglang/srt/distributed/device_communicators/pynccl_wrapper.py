@@ -277,6 +277,10 @@ class NCCLLibrary:
         # it is better not to call it at all.
         # ncclResult_t  ncclCommDestroy(ncclComm_t comm);
         Function("ncclCommDestroy", ncclResult_t, [ncclComm_t]),
+        # ncclResult_t ncclGroupStart();
+        Function("ncclGroupStart", ncclResult_t, []),
+        # ncclResult_t ncclGroupEnd();
+        Function("ncclGroupEnd", ncclResult_t, []),
     ]
 
     # class attribute to store the mapping from the path to the library

@@ -142,16 +142,16 @@ if supports_custom_op():
     )
 
     def reg_all_gather_into_tensor(
-        output: torch.Tensor, input: torch.Tensor, group_name: str
+        output: torch.Tensor, input: torch.Tensor, group_name: str, sizes: Optional[List[int]] = None,
     ) -> None:
         assert group_name in _groups, f"Group {group_name} is not found."
         group = _groups[group_name]()
         if group is None:
             raise ValueError(f"Group {group_name} is destroyed.")
-        group._all_gather_into_tensor(output, input)
+        group._all_gather_into_tensor(output, input, sizes)
 
     def reg_all_gather_into_tensor_fake(
-        output: torch.Tensor, input: torch.Tensor, group_name: str
+        output: torch.Tensor, input: torch.Tensor, group_name: str, sizes: Optional[List[int]] = None,
     ) -> None:
         pass
 
@@ -502,21 +502,22 @@ class GroupCoordinator:
         torch.distributed.reduce_scatter(output, input_list, group=self.device_group)
         return output
 
-    def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+    def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor, sizes: Optional[List[int]] = None):
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.all_gather(output, input)
+            pynccl_comm.all_gather(output, input, sizes)
         else:
+            assert not sizes, "Varying sizes for all-gather not supported with torch.distributed communicator"
             torch.distributed.all_gather_into_tensor(
                 output, input, group=self.device_group
             )
 
-    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
+    def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor, sizes: Optional[List[int]] = None):
         if not supports_custom_op():
-            self._all_gather_into_tensor(output, input)
+            self._all_gather_into_tensor(output, input, sizes)
         else:
             torch.ops.sglang.reg_all_gather_into_tensor(
-                output, input, group_name=self.unique_name
+                output, input, group_name=self.unique_name, sizes
             )
 
     def all_gather(
@@ -524,6 +525,7 @@ class GroupCoordinator:
         input_: torch.Tensor,
         dim: int = -1,
         output_tensor_list: Optional[List[torch.Tensor]] = None,
+        sizes: Optional[List[int]] = None,
     ) -> torch.Tensor:
         world_size = self.world_size
         # Bypass the function if we are using only 1 GPU.
@@ -539,6 +541,7 @@ class GroupCoordinator:
                 return input_
 
         if output_tensor_list is not None:
+            assert not sizes, "Varying sizes for all-gather not supported with output_tensor_list"
             # TODO(ch-wan): support other backends
             return torch.distributed.all_gather(
                 output_tensor_list, input_, group=self.device_group
@@ -551,12 +554,24 @@ class GroupCoordinator:
         # For HPUs, use HPU communicator.
         hpu_comm = self.hpu_communicator
         if hpu_comm is not None and not hpu_comm.disabled:
+            assert not sizes, "Varying sizes for all-gather not supported with HPU communicator"
             return hpu_comm.all_gather(input_, dim)
 
         # For NPUs, use NPU communicator.
         npu_comm = self.npu_communicator
         if npu_comm is not None and not npu_comm.disabled:
+            assert not sizes, "Varying sizes for all-gather not supported with NPU communicator"
             return npu_comm.all_gather(input_, dim)
+        
+        if sizes is not None:
+            assert len(sizes) == world_size
+            assert input_.shape[dim] == sizes[self.rank_in_group]
+            # 'sizes' is not needed if all inputs in the same TP group have the same shape
+            for split_size in sizes[1:]:
+                if split_size != sizes[0]:
+                    break
+            else:
+                sizes = None
 
         if dim < 0:
             # Convert negative dim to positive.
@@ -565,13 +580,16 @@ class GroupCoordinator:
         # NOTE: we have to use concat-style all-gather here,
         # stack-style all-gather has compatibility issues with
         # torch.compile . see https://github.com/pytorch/pytorch/issues/138795
-        output_size = (input_size[0] * world_size,) + input_size[1:]
+        if sizes:
+            output_size = (sum(sizes),) + input_size[1:]
+        else:
+            output_size = (input_size[0] * world_size,) + input_size[1:]
         # Allocate output tensor.
         output_tensor = torch.empty(
             output_size, dtype=input_.dtype, device=input_.device
         )
         # All-gather.
-        self.all_gather_into_tensor(output_tensor, input_)
+        self.all_gather_into_tensor(output_tensor, input_, sizes=sizes)
         # Reshape
         output_tensor = output_tensor.reshape((world_size,) + input_size)
         output_tensor = output_tensor.movedim(0, dim)
@@ -579,6 +597,25 @@ class GroupCoordinator:
             input_size[:dim] + (world_size * input_size[dim],) + input_size[dim + 1 :]
         )
         return output_tensor
+    
+    def all_gather_list(
+        input_list: List[torch.Tensor],
+        dim: int = -1,
+        output_tensor_list: Optional[List[torch.Tensor]] = None,
+        sizes: Optional[List[int]] = None,):
+        output_list = []
+
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.group_start()
+
+        for inp in input_list:
+            output_list.append(self.all_gather(inp, dim, sizes=sizes))
+        
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            pynccl_comm.group_end()
+
+        return output_list
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

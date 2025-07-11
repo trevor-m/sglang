@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 
 cudaError_t = ctypes.c_int
 cudaMemcpyKind = ctypes.c_int
+cudaStream_t = ctypes.c_void_p
 
 
 class cudaIpcMemHandle_t(ctypes.Structure):
@@ -88,6 +89,12 @@ class CudaRTLibrary:
             "cudaMemcpy",
             cudaError_t,
             [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, cudaMemcpyKind],
+        ),
+        # ​cudaError_t cudaMemcpy ( void* dst, const void* src, size_t count, cudaMemcpyKind kind, cudaStream_t stream = 0) # noqa
+        Function(
+            "cudaMemcpyAsync",
+            cudaError_t,
+            [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, cudaMemcpyKind, cudaStream_t],
         ),
         # cudaError_t cudaIpcGetMemHandle ( cudaIpcMemHandle_t* handle, void* devPtr ) # noqa
         Function(
@@ -164,6 +171,13 @@ class CudaRTLibrary:
         cudaMemcpyDefault = 4
         kind = cudaMemcpyDefault
         self.CUDART_CHECK(self.funcs["cudaMemcpy"](dst, src, count, kind))
+
+    def cudaMemcpyAsync(
+        self, dst: ctypes.c_void_p, src: ctypes.c_void_p, count: int, stream: cudaStream_t
+    ) -> None:
+        cudaMemcpyDefault = 4
+        kind = cudaMemcpyDefault
+        self.CUDART_CHECK(self.funcs["cudaMemcpyAsync"](dst, src, count, kind, stream))
 
     def cudaIpcGetMemHandle(self, devPtr: ctypes.c_void_p) -> cudaIpcMemHandle_t:
         handle = cudaIpcMemHandle_t()

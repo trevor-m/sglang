@@ -9,7 +9,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup, ReduceOp
+import threading
 
+from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
 from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     NCCLLibrary,
     buffer_type,
@@ -24,6 +26,23 @@ from sglang.srt.distributed.utils import StatelessProcessGroup
 logger = logging.getLogger(__name__)
 
 
+class PyNcclSymmetricMemory:
+    def __init__(self, nccl: NCCLLibrary, comm: ncclComm_t, size: int):
+        self.nccl = nccl
+        self.comm = comm
+        self.size = size
+        self.ptr = self.nccl.ncclMemAlloc(size)
+        win_flags = 1 # NCCL_WIN_COLL_SYMMETRIC
+        self.window = self.nccl.ncclCommWindowRegister(self.comm, self.ptr, size, win_flags)
+
+    def data_ptr(self):
+        return self.ptr
+    
+    def __del__(self):
+        self.nccl.ncclCommWindowDeregister(self.comm, self.window)
+        self.nccl.ncclMemFree(self.ptr)
+
+
 class PyNcclCommunicator:
 
     def __init__(
@@ -31,6 +50,7 @@ class PyNcclCommunicator:
         group: Union[ProcessGroup, StatelessProcessGroup],
         device: Union[int, str, torch.device],
         library_path: Optional[str] = None,
+        device_group: Optional[Union[ProcessGroup, StatelessProcessGroup]] = None,
     ):
         """
         Args:
@@ -65,7 +85,8 @@ class PyNcclCommunicator:
             return
         try:
             self.nccl = NCCLLibrary(library_path)
-        except Exception:
+        except Exception as e:
+            logger.warning("Error loading NCCL, disabling. Error reason: %s", e)
             # disable because of missing NCCL library
             # e.g. in a non-GPU environment
             self.available = False
@@ -118,6 +139,14 @@ class PyNcclCommunicator:
             self.stream.synchronize()
             del data
 
+            # Create symmetric memory pool
+            # backend = device_group._get_backend(torch.device(device))
+            # pool = torch.cuda.MemPool(backend.mem_allocator)#, symm_mem=True)
+            # with torch.cuda.use_mem_pool(pool):
+            #     self.symm_mem_workspace = torch.arange(1024 * 1024 * 2, device=device, dtype=torch.uint8)
+            self.symm_mem_workspace = PyNcclSymmetricMemory(self.nccl, self.comm, 1024*1024*512) #29360128
+
+        self.cuda_lib = CudaRTLibrary()
         # by default it is disabled, e.g. in profiling models and prefill phase.
         # to use it, use under `with obj.change_state(enable=True)`, usually
         # when we are using CUDA graph.
@@ -214,16 +243,29 @@ class PyNcclCommunicator:
         if stream is None:
             stream = self.stream
 
+        assert self.symm_mem_workspace.size >= input_tensor.nbytes, f"symmetric memory is too small - need {input_tensor.nbytes} bytes"
+        self.cuda_lib.cudaMemcpyAsync(
+            self.symm_mem_workspace.data_ptr(),
+            buffer_type(input_tensor.data_ptr()),
+            input_tensor.nbytes,
+            cudaStream_t(stream.cuda_stream)
+        )
+
+        current_rank_output = 0
         if sizes is not None:
+            numel_base = int(np.prod(input_tensor.shape[1:]))
             split_offset = 0
             self.nccl.ncclGroupStart()
             for root, split_size in enumerate(sizes):
-                chunk = input_tensor[split_offset : split_offset + split_size, ...]
+                #chunk = input_tensor[split_offset : split_offset + split_size, ...]
+                output_ptr = buffer_type(self.symm_mem_workspace.data_ptr().value + split_offset * numel_base * input_tensor.element_size())
+                if root == self.rank:
+                    current_rank_output = output_ptr
 
                 self.nccl.ncclReduce(
-                    buffer_type(chunk.data_ptr()),
-                    buffer_type(output_tensor.data_ptr()),
-                    chunk.numel(),
+                    output_ptr, #buffer_type(chunk.data_ptr()),
+                    output_ptr, #buffer_type(output_tensor.data_ptr()),
+                    split_size * numel_base, #chunk.numel(),
                     ncclDataTypeEnum.from_torch(input_tensor.dtype),
                     ncclRedOpTypeEnum.from_torch(op),
                     root,
@@ -233,15 +275,24 @@ class PyNcclCommunicator:
                 split_offset += split_size
             self.nccl.ncclGroupEnd()
         else:
+            current_rank_output = buffer_type(self.symm_mem_workspace.data_ptr().value + self.rank * output_tensor.nbytes)
             self.nccl.ncclReduceScatter(
-                buffer_type(input_tensor.data_ptr()),
-                buffer_type(output_tensor.data_ptr()),
+                self.symm_mem_workspace.data_ptr(), #buffer_type(input_tensor.data_ptr()),
+                current_rank_output, #buffer_type(output_tensor.data_ptr()),
                 output_tensor.numel(),
                 ncclDataTypeEnum.from_torch(input_tensor.dtype),
                 ncclRedOpTypeEnum.from_torch(op),
                 self.comm,
                 cudaStream_t(stream.cuda_stream),
             )
+        
+        self.cuda_lib.cudaMemcpyAsync(
+            buffer_type(output_tensor.data_ptr()),
+            current_rank_output,
+            output_tensor.nbytes,
+            cudaStream_t(stream.cuda_stream)
+        )
+
 
     def send(self, tensor: torch.Tensor, dst: int, stream=None):
         if self.disabled:

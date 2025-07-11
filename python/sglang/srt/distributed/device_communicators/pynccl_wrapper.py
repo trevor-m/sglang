@@ -67,6 +67,7 @@ def find_nccl_library() -> str:
 
 ncclResult_t = ctypes.c_int
 ncclComm_t = ctypes.c_void_p
+ncclWindow_t = ctypes.c_void_p
 
 
 class ncclUniqueId(ctypes.Structure):
@@ -301,6 +302,14 @@ class NCCLLibrary:
         Function("ncclGroupStart", ncclResult_t, []),
         # ncclResult_t ncclGroupEnd();
         Function("ncclGroupEnd", ncclResult_t, []),
+        # ncclResult_t ncclMemAlloc(void **ptr, size_t size);
+        Function("ncclMemAlloc", ncclResult_t, [ctypes.POINTER(buffer_type), ctypes.c_size_t]),
+        # ncclResult_t ncclMemFree(void *ptr);
+        Function("ncclMemFree", ncclResult_t, [buffer_type, ctypes.c_size_t]),
+        # ncclResult_t ncclCommWindowRegister(ncclComm_t comm, void* buff, size_t size, ncclWindow_t* win, int winFlags);
+        Function("ncclCommWindowRegister", ncclResult_t, [ncclComm_t, buffer_type, ctypes.c_size_t, ctypes.POINTER(ncclWindow_t), ctypes.c_int]),
+        # ncclResult_t ncclCommWindowDeregister(ncclComm_t comm, ncclWindow_t win);
+        Function("ncclCommWindowDeregister", ncclResult_t, [ncclComm_t, ncclWindow_t]),
     ]
 
     # class attribute to store the mapping from the path to the library
@@ -512,6 +521,21 @@ class NCCLLibrary:
     def ncclGroupEnd(self) -> None:
         self.NCCL_CHECK(self._funcs["ncclGroupEnd"]())
 
+    def ncclMemAlloc(self, size: int) -> buffer_type:
+        ptr = buffer_type()
+        self.NCCL_CHECK(self._funcs["ncclMemAlloc"](ctypes.byref(ptr), size))
+        return ptr
+
+    def ncclMemFree(self, ptr: buffer_type) -> None:
+        self.NCCL_CHECK(self._funcs["ncclMemFree"](ptr))
+    
+    def ncclCommWindowRegister(self, comm: ncclComm_t, buff: buffer_type, size: int, win_flags: int) -> ncclWindow_t:
+        window = ncclWindow_t()
+        self.NCCL_CHECK(self._funcs["ncclCommWindowRegister"](comm, buff, size, ctypes.byref(window), win_flags))
+        return window
+
+    def ncclCommWindowDeregister(self, comm: ncclComm_t, window: ncclWindow_t) -> None:
+        self.NCCL_CHECK(self._funcs["ncclCommWindowDeregister"](comm, window))
 
 __all__ = [
     "NCCLLibrary",

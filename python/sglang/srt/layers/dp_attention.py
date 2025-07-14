@@ -229,8 +229,24 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
+    # if is_partial:
+    #     # dp_rank = get_attention_dp_rank()
+    #     # split_indices = torch.cumsum(torch.tensor(forward_batch.global_num_tokens_cpu), dim=0)[:-1]
+    #     # tensor_list = list(global_tokens.tensor_split(split_indices))
+    #     # local_num_tokens = forward_batch.global_num_tokens_cpu[dp_rank]
+    #     # # local num tokens is wrong
+    #     # # orig_local_tokens = local_tokens.shape
+    #     # # if local_num_tokens < local_tokens.shape[0]:
+    #     # local_tokens = local_tokens[:local_num_tokens, ...]
+    #     # # if not torch.cuda.is_current_stream_capturing():
+    #     # #     logger.info(f"{is_partial} {forward_batch.global_num_tokens_gpu=} {split_indices=} {global_tokens.shape=} {local_tokens.shape=} tensor_list.shapes={[x.shape for x in tensor_list]}")
+    #     # get_tp_group().all_gather(local_tokens, 0, tensor_list)
+    #     #get_tp_group().all_gather_into_tensor(global_tokens, local_tokens)
+    #     #return
+
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
+    #logger.info(f"{forward_batch.global_num_tokens_cpu=} {global_tokens.shape=} {local_tokens.shape=}")
     global_tokens.fill_(0)
     assert local_tokens.is_contiguous()
     assert global_tokens.is_contiguous()

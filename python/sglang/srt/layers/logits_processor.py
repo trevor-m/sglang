@@ -102,6 +102,7 @@ class LogitsMetadata:
     # DP attention metadata. Not needed when DP attention is not used.
     # Number of tokens in the request.
     global_num_tokens_gpu: Optional[torch.Tensor] = None
+    global_num_tokens_cpu: Optional[torch.Tensor] = None
     # The start position of local hidden states.
     dp_local_start_pos: Optional[torch.Tensor] = None
     dp_local_num_tokens: Optional[torch.Tensor] = None
@@ -157,6 +158,7 @@ class LogitsMetadata:
             extend_input_logprob_token_ids_gpu=forward_batch.extend_input_logprob_token_ids_gpu,
             padded_static_len=forward_batch.padded_static_len,
             global_num_tokens_gpu=forward_batch.global_num_tokens_gpu,
+            global_num_tokens_cpu=forward_batch.global_num_tokens_cpu,
             dp_local_start_pos=forward_batch.dp_local_start_pos,
             dp_local_num_tokens=forward_batch.dp_local_num_tokens,
             gathered_buffer=forward_batch.gathered_buffer,

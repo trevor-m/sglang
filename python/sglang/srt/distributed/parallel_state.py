@@ -1437,3 +1437,16 @@ def monkey_patch_vllm_parallel_state(reverse: bool = False):
         setattr(vllm_parrlel_state, "get_pp_group", get_pp_group)
         setattr(vllm_parrlel_state, "get_tp_group", get_tp_group)
         setattr(vllm_parrlel_state, "get_world_group", get_world_group)
+
+_pool = None
+
+def tensor_model_parallel_mempool_ctx():
+    if False: #TODO check server arg
+        return nullcontext()
+    
+    global _pool
+    if _pool is None:
+        device = torch.device(f"cuda:{get_tensor_model_parallel_rank()}")
+        backend = get_tp_group().device_group._get_backend(device)
+        _pool = torch.cuda.MemPool(backend.mem_allocator, symmetric=True)
+    return torch.cuda.use_mem_pool(_pool)

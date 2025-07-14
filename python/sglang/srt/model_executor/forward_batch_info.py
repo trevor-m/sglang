@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from sglang.srt.distributed.parallel_state import tensor_model_parallel_mempool_ctx
 
 import torch
 import triton
@@ -344,11 +345,12 @@ class ForwardBatch:
             ).to(device, non_blocking=True)
 
             sum_len = sum(global_num_tokens)
-            ret.gathered_buffer = torch.zeros(
-                (sum_len, model_runner.model_config.hidden_size),
-                dtype=model_runner.dtype,
-                device=device,
-            )
+            with tensor_model_parallel_mempool_ctx():
+                ret.gathered_buffer = torch.zeros(
+                    (sum_len, model_runner.model_config.hidden_size),
+                    dtype=model_runner.dtype,
+                    device=device,
+                )
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)

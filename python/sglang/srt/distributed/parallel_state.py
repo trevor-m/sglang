@@ -269,7 +269,6 @@ class GroupCoordinator:
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
-                device_group=self.device_group,
             )
 
         from sglang.srt.distributed.device_communicators.pymscclpp import (

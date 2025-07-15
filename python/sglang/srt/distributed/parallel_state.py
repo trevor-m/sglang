@@ -49,6 +49,7 @@ from sglang.srt.utils import (
     supports_custom_op,
 )
 
+from sglang.srt.distributed.device_communicators.pynccl_allocator import get_nccl_mem_pool
 
 @dataclass
 class GraphCaptureContext:
@@ -266,6 +267,7 @@ class GroupCoordinator:
 
         self.pynccl_comm: Optional[PyNcclCommunicator] = None
         if use_pynccl and self.world_size > 1:
+            get_nccl_mem_pool()
             self.pynccl_comm = PyNcclCommunicator(
                 group=self.cpu_group,
                 device=self.device,
@@ -1411,6 +1413,18 @@ def get_tensor_model_parallel_rank():
     """Return my rank for the tensor model parallel group."""
     return get_tp_group().rank_in_group
 
+
+def tensor_model_parallel_mempool_ctx():
+    if False: #TODO check server arg
+        return nullcontext()
+    #from sglang.srt.distributed.device_communicators.pynccl_allocator import get_nccl_mem_pool
+    return torch.cuda.use_mem_pool(get_nccl_mem_pool())
+
+def tensor_model_parallel_register_window(tensor: torch.Tensor):
+    return get_tp_group().pynccl_comm.register_comm_window(tensor)
+
+def tensor_model_parallel_deregister_window(window):
+    get_tp_group().pynccl_comm.deregister_comm_window(window)
 
 def destroy_model_parallel():
     """Set the groups to none and destroy them."""

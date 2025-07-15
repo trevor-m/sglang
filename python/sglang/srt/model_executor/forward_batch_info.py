@@ -32,12 +32,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, ClassVar, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.distributed.parallel_state import (
+    tensor_model_parallel_mempool_ctx,
+    tensor_model_parallel_register_window,
+    tensor_model_parallel_deregister_window,
+)
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
 from sglang.srt.utils import (
     flatten_nested_list,
@@ -254,6 +259,8 @@ class ForwardBatch:
     dp_local_start_pos: Optional[torch.Tensor] = None  # cached info at runtime
     dp_local_num_tokens: Optional[torch.Tensor] = None  # cached info at runtime
     gathered_buffer: Optional[torch.Tensor] = None
+    gathered_buffer_base: ClassVar[Optional[torch.Tensor]] = None
+    gathered_buffer_base_window_handle: ClassVar[Any] = None
     is_extend_in_batch: bool = False
     can_run_dp_cuda_graph: bool = False
     global_forward_mode: Optional[ForwardMode] = None
@@ -353,11 +360,7 @@ class ForwardBatch:
             ).to(device, non_blocking=True)
 
             sum_len = sum(global_num_tokens)
-            ret.gathered_buffer = torch.zeros(
-                (sum_len, model_runner.model_config.hidden_size),
-                dtype=model_runner.dtype,
-                device=device,
-            )
+            ret.gathered_buffer = cls.get_gathered_buffer_view(sum_len, model_runner.model_config.hidden_size, model_runner.dtype, device)
 
         if ret.forward_mode.is_idle():
             ret.positions = torch.empty((0,), device=device)
@@ -413,6 +416,28 @@ class ForwardBatch:
         )
 
         return ret
+    
+    @classmethod
+    def get_gathered_buffer_view(cls, sum_len, hidden_size, dtype, device):
+        numel = sum_len * hidden_size
+        if (cls.gathered_buffer_base is not None and
+            cls.gathered_buffer_base.dtype == dtype and
+            cls.gathered_buffer_base.numel() >= numel):
+            view = cls.gathered_buffer_base.view(-1)[:numel].view(sum_len, hidden_size)
+            view.zero_()
+            return view
+        else:
+            if cls.gathered_buffer_base_window_handle is not None:
+                tensor_model_parallel_deregister_window(cls.gathered_buffer_base_window_handle)
+                cls.gathered_buffer_base_window_handle = None
+            with tensor_model_parallel_mempool_ctx():
+                cls.gathered_buffer_base = torch.zeros(
+                    (sum_len, hidden_size),
+                    dtype=dtype,
+                    device=device,
+                )
+            cls.gathered_buffer_base_window_handle = tensor_model_parallel_register_window(cls.gathered_buffer_base)
+            return cls.gathered_buffer_base
 
     def merge_mm_inputs(self) -> Optional[MultimodalInputs]:
         """

@@ -28,7 +28,13 @@ from torch.profiler import ProfilerActivity, profile
 
 from sglang.srt.custom_op import CustomOp
 from sglang.srt.distributed import get_tensor_model_parallel_rank
-from sglang.srt.distributed.parallel_state import GroupCoordinator, graph_capture
+from sglang.srt.distributed.parallel_state import (
+    GroupCoordinator,
+    graph_capture,
+    tensor_model_parallel_mempool_ctx,
+    tensor_model_parallel_register_window,
+    tensor_model_parallel_deregister_window,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.torchao_utils import save_gemlite_cache
 from sglang.srt.managers.schedule_batch import global_server_args_dict
@@ -306,13 +312,15 @@ class CudaGraphRunner:
                 self.encoder_lens = None
 
             if self.require_gathered_buffer:
-                self.gathered_buffer = torch.zeros(
-                    (
-                        self.max_num_token,
-                        self.model_runner.model_config.hidden_size,
-                    ),
-                    dtype=self.model_runner.dtype,
-                )
+                with tensor_model_parallel_mempool_ctx():
+                    self.gathered_buffer = torch.zeros(
+                        (
+                            self.max_num_token,
+                            self.model_runner.model_config.hidden_size,
+                        ),
+                        dtype=self.model_runner.dtype,
+                    )
+                window_handle = tensor_model_parallel_register_window(self.gathered_buffer)
                 if self.require_mlp_tp_gather:
                     self.global_num_tokens_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32

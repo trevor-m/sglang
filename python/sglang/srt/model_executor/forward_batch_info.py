@@ -419,6 +419,12 @@ class ForwardBatch:
     
     @classmethod
     def get_gathered_buffer_view(cls, sum_len, hidden_size, dtype, device):
+        # if True:
+        #     return torch.zeros(
+        #         (sum_len, hidden_size),
+        #         dtype=dtype,
+        #         device=device,
+        #     )
         numel = sum_len * hidden_size
         if (cls.gathered_buffer_base is not None and
             cls.gathered_buffer_base.dtype == dtype and

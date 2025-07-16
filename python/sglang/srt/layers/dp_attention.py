@@ -248,6 +248,19 @@ def _dp_gather(
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
+    
+    if is_partial:
+        sizes = forward_batch.global_num_tokens_cpu
+        dp_rank = get_attention_dp_rank()
+        cumtokens = torch.cumsum(torch.tensor(sizes), dim=0)
+        if dp_rank == 0:
+            local_start_pos = 0
+        else:
+            local_start_pos = cumtokens[dp_rank - 1]
+        local_num_tokens = min(sizes[dp_rank], local_tokens.shape[0])
+        local_tokens_view = global_tokens[local_start_pos:local_start_pos+local_num_tokens, ...]
+        get_tp_group().all_gatherv(local_tokens_view, sizes=sizes, output_tensor=global_tokens)
+        return
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8

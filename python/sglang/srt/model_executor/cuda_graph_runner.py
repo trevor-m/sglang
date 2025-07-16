@@ -320,7 +320,7 @@ class CudaGraphRunner:
                         ),
                         dtype=self.model_runner.dtype,
                     )
-                window_handle = tensor_model_parallel_register_window(self.gathered_buffer)
+                self.window_handle = tensor_model_parallel_register_window(self.gathered_buffer)
                 if self.require_mlp_tp_gather:
                     self.global_num_tokens_gpu = torch.zeros(
                         (self.dp_size,), dtype=torch.int32
@@ -541,6 +541,7 @@ class CudaGraphRunner:
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
+            global_num_tokens_cpu=global_num_tokens.cpu(),
             gathered_buffer=gathered_buffer,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,

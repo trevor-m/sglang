@@ -313,7 +313,7 @@ class PyNcclCommunicator:
         self.nccl.ncclGroupEnd()
     
     def register_comm_window(self, tensor: torch.Tensor):
-        return self.nccl.ncclCommWindowRegister(self.comm, buffer_type(tensor.data_ptr()), tensor.numel(), 1)
+        return self.nccl.ncclCommWindowRegister(self.comm, buffer_type(tensor.data_ptr()), tensor.nbytes, 1)
 
     def deregister_comm_window(self, window):
         return self.nccl.ncclCommWindowDeregister(self.comm, window)

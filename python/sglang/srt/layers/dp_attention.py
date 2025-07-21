@@ -248,19 +248,6 @@ def _dp_gather(
         memcpy_triton(
             global_tokens, local_tokens, 0, local_start_pos, local_num_tokens, False
         )
-    
-    if is_partial:
-        sizes = forward_batch.global_num_tokens_cpu
-        dp_rank = get_attention_dp_rank()
-        cumtokens = torch.cumsum(torch.tensor(sizes), dim=0)
-        if dp_rank == 0:
-            local_start_pos = 0
-        else:
-            local_start_pos = cumtokens[dp_rank - 1]
-        local_num_tokens = min(sizes[dp_rank], local_tokens.shape[0])
-        local_tokens_view = global_tokens[local_start_pos:local_start_pos+local_num_tokens, ...]
-        get_tp_group().all_gatherv(local_tokens_view, sizes=sizes, output_tensor=global_tokens)
-        return
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.
     NUM_GPUS_PER_NODE = 8
@@ -281,7 +268,26 @@ def dp_gather_partial(
     local_tokens: torch.Tensor,
     forward_batch: ForwardBatch,
 ):
-    _dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
+    sizes = forward_batch.global_num_tokens_cpu
+    dp_rank = get_attention_dp_rank()
+    if sizes is None:
+        dp_size = get_attention_dp_size()
+        local_num_tokens = global_tokens.shape[0] // dp_size
+        local_start_pos = dp_rank * local_num_tokens
+    else:
+        cumtokens = torch.cumsum(torch.tensor(sizes), dim=0)
+        if dp_rank == 0:
+            local_start_pos = 0
+        else:
+            local_start_pos = cumtokens[dp_rank - 1]
+        local_num_tokens = min(sizes[dp_rank], local_tokens.shape[0])
+    global_tokens.fill_(0)
+    local_tokens_view = global_tokens[local_start_pos:local_start_pos+local_num_tokens, ...]
+    #logger.info(f"{local_tokens_view.shape=} {local_tokens.shape=} {global_tokens.shape=}")
+    local_tokens_view[:] = local_tokens[:local_num_tokens, ...]
+    get_tp_group().all_gatherv(local_tokens_view, sizes=sizes, output_tensor=global_tokens)
+
+    #_dp_gather(global_tokens, local_tokens, forward_batch, is_partial=True)
 
 
 def dp_gather_replicate(
@@ -297,6 +303,24 @@ def dp_scatter(
     global_tokens: torch.Tensor,  # input
     forward_batch: ForwardBatch,
 ):
+    #logger.info(f"{forward_batch.__class__.__name__=}")
+    if forward_batch.__class__.__name__ == "ForwardBatch":
+        sizes = forward_batch.global_num_tokens_cpu
+        dp_rank = get_attention_dp_rank()
+        if sizes is None:
+            dp_size = get_attention_dp_size()
+            local_num_tokens = global_tokens.shape[0] // dp_size
+            local_start_pos = dp_rank * local_num_tokens
+        else:
+            cumtokens = torch.cumsum(torch.tensor(sizes), dim=0)
+            if dp_rank == 0:
+                local_start_pos = 0
+            else:
+                local_start_pos = cumtokens[dp_rank - 1]
+            local_num_tokens = min(sizes[dp_rank], local_tokens.shape[0])
+        local_tokens.fill_(0)
+        local_tokens[:local_num_tokens, ...] = global_tokens[local_start_pos:local_start_pos+local_num_tokens, ...]
+        return
     # local_num_tokens is not necessarily the same as local_tokens.shape[0],
     # since local_tokens may be padded for cuda graph
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)

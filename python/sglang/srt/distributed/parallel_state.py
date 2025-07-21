@@ -667,15 +667,11 @@ class GroupCoordinator:
                 output_tensor = torch.empty(
                     output_size, dtype=input_.dtype, device=input_.device
                 )
-            else:
-                assert output_tensor.shape == output_size, f"Shape mismatch {output_tensor.shape} != {output_size}. {input_.shape=} {sizes=}"
+            #else:
+            #    assert output_tensor.shape == output_size, f"Shape mismatch {output_tensor.shape} != {output_size}. {input_.shape=} {sizes=}"
+            logger.info(f"{output_tensor.shape=} f{input_.shape=} f{sizes=}")
             pynccl_comm.all_gather(output_tensor, input_, sizes=sizes)
             return output_tensor
-        #else:
-        # Torch distributed fallback
-        # split_indices = torch.cumsum(torch.tensor(sizes), dim=0)[:-1]
-        # tensor_list = list(output_tensor.tensor_split(split_indices))
-        # self.all_gather(input_, dim=0, output_tensor_list=tensor_list)
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

@@ -433,15 +433,15 @@ class ForwardBatch:
             view.zero_()
             return view
         else:
-            if cls.gathered_buffer_base_window_handle is not None:
-                tensor_model_parallel_deregister_window(cls.gathered_buffer_base_window_handle)
-                cls.gathered_buffer_base_window_handle = None
+            # if cls.gathered_buffer_base_window_handle is not None:
+            #     tensor_model_parallel_deregister_window(cls.gathered_buffer_base_window_handle)
+            #     cls.gathered_buffer_base_window_handle = None
             with tensor_model_parallel_mempool_ctx():
-                cls.gathered_buffer_base = torch.zeros(
-                    (sum_len, hidden_size),
+                cls.gathered_buffer_base = torch.empty(
+                    (9880, hidden_size),
                     dtype=dtype,
                     device=device,
-                )
+                ).zero_()
             cls.gathered_buffer_base_window_handle = tensor_model_parallel_register_window(cls.gathered_buffer_base)
             return cls.gathered_buffer_base
 

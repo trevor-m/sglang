@@ -313,13 +313,13 @@ class CudaGraphRunner:
 
             if self.require_gathered_buffer:
                 with tensor_model_parallel_mempool_ctx():
-                    self.gathered_buffer = torch.zeros(
+                    self.gathered_buffer = torch.empty(
                         (
                             self.max_num_token,
                             self.model_runner.model_config.hidden_size,
                         ),
                         dtype=self.model_runner.dtype,
-                    )
+                    ).zero_()
                 self.window_handle = tensor_model_parallel_register_window(self.gathered_buffer)
                 if self.require_mlp_tp_gather:
                     self.global_num_tokens_gpu = torch.zeros(
@@ -497,7 +497,11 @@ class CudaGraphRunner:
                 )
             )
             global_num_tokens = self.global_num_tokens_gpu
-            gathered_buffer = self.gathered_buffer[:num_tokens]
+            
+
+            gathered_buffer = self.gathered_buffer[:sum([max(global_num_tokens) for _ in range(len(global_num_tokens))])]
+            logger.info(f"{self.gathered_buffer.shape=} {gathered_buffer.shape=} {global_num_tokens=}")
+            #gathered_buffer = self.gathered_buffer[:num_tokens]
         elif self.require_attn_tp_gather:
             self.global_num_tokens_gpu.copy_(
                 torch.tensor(
@@ -541,7 +545,7 @@ class CudaGraphRunner:
             return_logprob=False,
             positions=positions,
             global_num_tokens_gpu=global_num_tokens,
-            global_num_tokens_cpu=global_num_tokens.cpu(),
+            global_num_tokens_cpu=None,
             gathered_buffer=gathered_buffer,
             mrope_positions=mrope_positions,
             spec_algorithm=self.model_runner.spec_algorithm,

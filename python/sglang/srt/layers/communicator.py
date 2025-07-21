@@ -398,7 +398,6 @@ class CommunicateWithAllReduceAndLayerNormFn:
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)
-            # copy hidden_states into residual
             dp_scatter(residual, hidden_states, forward_batch)
             if hidden_states.shape[0] != 0:
                 hidden_states = layernorm(hidden_states)

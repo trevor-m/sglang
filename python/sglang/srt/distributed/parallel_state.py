@@ -650,11 +650,12 @@ class GroupCoordinator:
             assert (
                 pynccl_comm is not None and not pynccl_comm.disabled
             ), "pynccl is required for all_gatherv"
-            # if pynccl_comm is not None and not pynccl_comm.disabled:
+
+
             input_size = input_.size()
             if sizes is not None:
                 assert len(sizes) == world_size
-                #assert input_.shape[dim] == sizes[self.rank_in_group]
+                assert input_.shape[dim] == sizes[self.rank_in_group]
                 output_size = (sum(sizes),) + input_size[1:]
                 # 'sizes' is not needed if all inputs in the same group have the same shape
                 if all(s == sizes[0] for s in sizes):
@@ -666,17 +667,15 @@ class GroupCoordinator:
                 output_tensor = torch.empty(
                     output_size, dtype=input_.dtype, device=input_.device
                 )
-            #else:
-            #    assert output_tensor.shape == output_size, f"Shape mismatch {output_tensor.shape} != {output_size}. {input_.shape=} {sizes=}"
+            else:
+                assert output_tensor.shape == output_size, f"Shape mismatch {output_tensor.shape} != {output_size}. {input_.shape=} {sizes=}"
             pynccl_comm.all_gather(output_tensor, input_, sizes=sizes)
             return output_tensor
-        # else:
-        #     # Torch distributed fallback
-        #     #self.all_gather_into_tensor(output_tensor, input_)
-        #     #split_indices = torch.cumsum(torch.tensor(sizes), dim=0)[:-1]
-        #     #tensor_list = list(output_tensor.tensor_split(split_indices))
-        #     #torch.cuda.synchronize()
-        #     #self.all_gather(input_, dim=0, output_tensor_list=tensor_list)
+        #else:
+        # Torch distributed fallback
+        # split_indices = torch.cumsum(torch.tensor(sizes), dim=0)[:-1]
+        # tensor_list = list(output_tensor.tensor_split(split_indices))
+        # self.all_gather(input_, dim=0, output_tensor_list=tensor_list)
 
     def gather(
         self, input_: torch.Tensor, dst: int = 0, dim: int = -1

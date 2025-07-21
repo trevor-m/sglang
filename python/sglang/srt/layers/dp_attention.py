@@ -227,19 +227,6 @@ def _dp_gather(
     forward_batch: ForwardBatch,
     is_partial: bool,
 ):
-    # if is_partial:
-    #     global_tokens.fill_(0)
-    #     local_tokens = local_tokens[:forward_batch.global_num_tokens_cpu[get_attention_dp_rank()], ...]
-    #     split_indices = torch.cumsum(torch.tensor(forward_batch.global_num_tokens_cpu), dim=0)[:-1]
-    #     tensor_list = list(global_tokens.tensor_split(split_indices))
-    #     #torch.cuda.synchronize()
-    #     get_tp_group().all_gather(local_tokens, dim=0, output_tensor_list=tensor_list)
-
-    #     # dp_rank = get_attention_dp_rank()
-    #     # local_num_tokens = min(forward_batch.global_num_tokens_cpu[dp_rank], local_tokens.shape[0])
-    #     # local_tokens = local_tokens[:local_num_tokens, ...]
-    #     # get_tp_group().all_gatherv(local_tokens, sizes=forward_batch.global_num_tokens_cpu)
-    #     return
     local_start_pos, local_num_tokens = get_dp_local_info(forward_batch)
 
     global_tokens.fill_(0)
@@ -263,45 +250,16 @@ def _dp_gather(
         )
     
     if is_partial:
-        
-        #logger.info(f"BEFORE {global_tokens=} {local_tokens=}")
-        #logger.info(f"{forward_batch.global_num_tokens_cpu=} {forward_batch.global_num_tokens_gpu=}")
         sizes = forward_batch.global_num_tokens_cpu
         dp_rank = get_attention_dp_rank()
-        # cumtokens = torch.cumsum(torch.tensor(sizes), dim=0)
-        # if dp_rank == 0:
-        #     local_start_pos_2 = 0
-        # else:
-        #     local_start_pos_2 = cumtokens[dp_rank - 1]
-        # local_num_tokens_2 = min(sizes[dp_rank], local_tokens.shape[0])
-        #local_tokens_view = global_tokens[local_start_pos:local_start_pos+local_num_tokens_2, ...]
-        if sizes is None:
-            local_num_tokens = global_tokens.shape[0] // get_attention_dp_size()
-            local_start_pos = dp_rank * local_num_tokens
-            local_tokens_view = global_tokens[local_start_pos:local_start_pos+local_num_tokens, ...]
+        cumtokens = torch.cumsum(torch.tensor(sizes), dim=0)
+        if dp_rank == 0:
+            local_start_pos = 0
         else:
-            cumtokens = torch.cumsum(torch.tensor(sizes), dim=0)
-            if dp_rank == 0:
-                local_start_pos = 0
-            else:
-                local_start_pos = cumtokens[dp_rank - 1]
-            local_num_tokens = min(sizes[dp_rank], local_tokens.shape[0])
-            local_tokens_view = global_tokens[local_start_pos:local_start_pos+local_num_tokens, ...]
-        #logger.info(f"{local_num_tokens=} vs {local_num_tokens_2=}  {local_start_pos=} vs {local_start_pos_2}")
-
-        #torch.cuda.synchronize()
-        #reference_input = global_tokens.clone()
-        #torch.cuda.synchronize()
-        #torch.ops.sglang.inplace_all_reduce(
-        #    reference_input, group_name=get_tp_group().unique_name
-        #)
-        #reference_input[:] = tensor_model_parallel_all_reduce(global_tokens)
-        #torch.cuda.synchronize()
-
+            local_start_pos = cumtokens[dp_rank - 1]
+        local_num_tokens = min(sizes[dp_rank], local_tokens.shape[0])
+        local_tokens_view = global_tokens[local_start_pos:local_start_pos+local_num_tokens, ...]
         get_tp_group().all_gatherv(local_tokens_view, sizes=sizes, output_tensor=global_tokens)
-        
-        #torch.testing.assert_close(global_tokens, reference_input, equal_nan=True, msg=f"====================\n{global_tokens=}\n{reference_input=}\n====================")
-        #global_tokens = global_tokens[:sum(sizes)]
         return
 
     # Input IDs are in int 32. We should use inplace_all_reduce for local case because of custom all reduce.

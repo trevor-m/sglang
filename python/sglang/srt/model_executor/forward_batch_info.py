@@ -336,7 +336,7 @@ class ForwardBatch:
 
         # For DP attention
         if batch.global_num_tokens is not None:
-            print(f"NO CUDA GRAPH: {batch.global_num_tokens=}")
+
             spec_num_draft_tokens = (
                 batch.spec_num_draft_tokens
                 if batch.spec_num_draft_tokens is not None
@@ -433,16 +433,15 @@ class ForwardBatch:
             view.zero_()
             return view
         else:
-            # if cls.gathered_buffer_base_window_handle is not None:
-            #     tensor_model_parallel_deregister_window(cls.gathered_buffer_base_window_handle)
-            #     cls.gathered_buffer_base_window_handle = None
+            if cls.gathered_buffer_base_window_handle is not None:
+                tensor_model_parallel_deregister_window(cls.gathered_buffer_base_window_handle)
+                cls.gathered_buffer_base_window_handle = None
             with tensor_model_parallel_mempool_ctx():
-                cls.gathered_buffer_base = torch.empty(
+                cls.gathered_buffer_base = torch.zeros(
                     (sum_len, hidden_size),
                     dtype=dtype,
                     device=device,
-                ).zero_()
-                # TODO: maybe barrier
+                )
             cls.gathered_buffer_base_window_handle = tensor_model_parallel_register_window(cls.gathered_buffer_base)
             return cls.gathered_buffer_base
 

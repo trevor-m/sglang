@@ -969,6 +969,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         tp_rank: Optional[int] = None,
         tp_size: Optional[int] = None,
     ) -> torch.Tensor:
+        # Scale by routed_scaling_factor is fused into select_experts.
         assert activation == "silu", "Only SiLU activation is supported."
 
         if self.enable_flashinfer_cutlass_moe:
@@ -999,8 +1000,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_rank=tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
             )[0]
-            if routed_scaling_factor is not None:
-                output *= routed_scaling_factor
             return output
 
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
@@ -1021,6 +1020,4 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             params=layer.cutlass_moe_params,
             apply_router_weight_on_input=apply_router_weight_on_input,
         ).to(x.dtype)
-        if routed_scaling_factor is not None:
-            output *= routed_scaling_factor
         return output

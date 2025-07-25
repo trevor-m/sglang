@@ -476,7 +476,11 @@ class DeepseekV2MoE(nn.Module):
             router_logits = self.gate(hidden_states)
             kwargs = {"hidden_states": hidden_states}
             if self.topk is not None:
-                kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+                kwargs["topk_output"] = self.topk(
+                    hidden_states,
+                    router_logits,
+                    apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk(),
+                )
             else:
                 kwargs["router_logits"] = router_logits
             final_hidden_states = self.experts(**kwargs)
@@ -501,7 +505,11 @@ class DeepseekV2MoE(nn.Module):
         router_logits = self.gate(hidden_states)
         kwargs = {"hidden_states": hidden_states}
         if self.topk is not None:
-            kwargs["topk_output"] = self.topk(hidden_states, router_logits)
+            kwargs["topk_output"] = self.topk(
+                hidden_states,
+                router_logits,
+                apply_routed_scaling_factor_on_output=self.experts.should_fuse_routed_scaling_factor_in_topk(),
+            )
         else:
             kwargs["router_logits"] = router_logits
         final_hidden_states = self.experts(**kwargs)

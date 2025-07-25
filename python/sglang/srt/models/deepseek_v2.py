@@ -62,6 +62,7 @@ from sglang.srt.layers.moe.ep_moe.layer import (
     use_flashinfer_trtllm_moe,
 )
 from sglang.srt.layers.moe.ep_moe.token_dispatcher import DeepEPDispatcher
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization import deep_gemm_wrapper
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -80,6 +81,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.quantization.int8_utils import (
     block_dequant as int8_block_dequant,
 )
+from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope, get_rope_wrapper
 from sglang.srt.layers.utils import is_sm100_supported
@@ -306,21 +308,6 @@ class DeepseekV2MoE(nn.Module):
             config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
         )
 
-        self.topk = (
-            TopK(
-                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
-                renormalize=config.norm_topk_prob,
-                use_grouped_topk=True,
-                num_expert_group=config.n_group,
-                num_fused_shared_experts=self.num_fused_shared_experts,
-                topk_group=config.topk_group,
-                correction_bias=self.gate.e_score_correction_bias,
-                routed_scaling_factor=self.routed_scaling_factor,
-            )
-            if not use_flashinfer_trtllm_moe
-            else None
-        )
-
         self.experts = get_moe_impl_class()(
             num_experts=config.n_routed_experts
             + self.num_fused_shared_experts
@@ -358,6 +345,23 @@ class DeepseekV2MoE(nn.Module):
                 if use_flashinfer_trtllm_moe
                 else {}
             ),
+        )
+        
+        apply_routed_scaling_factor_on_output = isinstance(self.experts, FusedMoE) and isinstance(self.experts.quant_method, ModelOptNvFp4FusedMoEMethod)
+        self.topk = (
+            TopK(
+                top_k=config.num_experts_per_tok + self.num_fused_shared_experts,
+                renormalize=config.norm_topk_prob,
+                use_grouped_topk=True,
+                num_expert_group=config.n_group,
+                num_fused_shared_experts=self.num_fused_shared_experts,
+                topk_group=config.topk_group,
+                correction_bias=self.gate.e_score_correction_bias,
+                routed_scaling_factor=self.routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+            )
+            if not use_flashinfer_trtllm_moe
+            else None
         )
 
         self.shared_experts_is_int8 = False

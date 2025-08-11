@@ -412,9 +412,9 @@ class CommunicateWithAllReduceAndLayerNormFn:
     ):
         if residual_input_mode == ScatterMode.SCATTERED and context.attn_tp_size > 1:
             residual, local_residual = (
-                forward_batch.gathered_buffer[
-                    : forward_batch.input_ids.shape[0]
-                ].clone(),
+                torch.empty_like(
+                    forward_batch.gathered_buffer[: forward_batch.input_ids.shape[0]]
+                ),
                 residual,
             )
             attn_tp_all_gather_into_tensor(residual, local_residual)
@@ -424,18 +424,16 @@ class CommunicateWithAllReduceAndLayerNormFn:
 
             # Perform layernorm on smaller data before comm. Only valid when attn_tp_size is 1 (tp_size == dp_size)
             use_layer_norm_before_gather = context.attn_tp_size == 1
-            if use_layer_norm_before_gather:
-                residual.copy_(hidden_states)
-                if hidden_states.shape[0] != 0:
-                    with use_symmetric_memory(
-                        get_tp_group(),
-                        disabled=not forward_batch.dp_padding_mode.is_max_len(),
-                    ) as sm:
-                        hidden_states = layernorm(hidden_states)
-                        sm.tag(hidden_states)
-
+            if use_layer_norm_before_gather and hidden_states.shape[0] != 0:
+                residual = hidden_states
+                with use_symmetric_memory(
+                    get_tp_group(),
+                    disabled=not forward_batch.dp_padding_mode.is_max_len(),
+                ) as sm:
+                    hidden_states = layernorm(hidden_states)
+                    sm.tag(hidden_states)
             hidden_states, local_hidden_states = (
-                forward_batch.gathered_buffer,
+                torch.empty_like(forward_batch.gathered_buffer),
                 hidden_states,
             )
             dp_gather_partial(hidden_states, local_hidden_states, forward_batch)

@@ -8,6 +8,9 @@ import torch
 from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tp_group
+from sglang.srt.distributed.device_communicators.pynccl_allocator import (
+    use_symmetric_memory,
+)
 from sglang.srt.layers.moe.cutlass_moe_params import CutlassMoEParams, CutlassMoEType
 from sglang.srt.layers.moe.utils import (
     should_use_flashinfer_cutlass_moe_fp4_allgather,
@@ -1202,9 +1205,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     ),
                 )
                 x_sf = nvfp4_block_scale_interleave(x_sf)
+                # Use symmetric memory for reduce scatter on output.
+                with use_symmetric_memory(
+                    get_tp_group(), disabled=not forward_batch.dp_padding_mode.is_max_len()
+                ) as sm:
+                    output = torch.empty(x.shape[0], x.shape[1] * 2, dtype=output_dtype, device=x.device)
+                    sm.tag(output)
+            else:
+                output = torch.empty_like(x)
 
-            output = flashinfer_cutlass_fused_moe(
+            flashinfer_cutlass_fused_moe(
                 input=x,
+                output=output,
                 token_selected_experts=topk_ids.to(torch.int),
                 token_final_scales=topk_weights,
                 fc1_expert_weights=layer.w13_weight.view(torch.long),
@@ -1224,7 +1236,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 tp_size=tp_size,
                 tp_rank=tp_rank,
                 tune_max_num_tokens=next_power_of_2(x.shape[0]),
-            )[0]
+            )
             if routed_scaling_factor is not None:
                 output *= routed_scaling_factor
 

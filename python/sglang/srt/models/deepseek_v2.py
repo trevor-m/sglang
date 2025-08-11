@@ -576,7 +576,7 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             with use_symmetric_memory(
-                parallel_state.get_tp_group(), disabled=disable_symmetric_memory
+                parallel_state.get_tp_group(), disabled=disable_symmetric_memory or should_use_flashinfer_cutlass_moe_fp4_allgather()
             ) as sm:
                 final_hidden_states_out = torch.empty_like(final_hidden_states)
             torch.add(final_hidden_states, shared_output, out=final_hidden_states_out)

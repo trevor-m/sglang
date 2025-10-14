@@ -133,20 +133,27 @@ class Indexer(CustomOp):
             self.sm_count = deep_gemm.get_num_sms()
             self.half_device_sm_count = align(self.sm_count // 2, 8)
 
-        self.wq_b = ReplicatedLinear(
-            self.q_lora_rank,
-            self.n_heads * self.head_dim,
+        self.fused_wq_b_and_wk = ReplicatedLinear(
+            self.q_lora_rank + self.hidden_size,
+            self.n_heads * self.head_dim + self.head_dim,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("wq_b", prefix),
+            prefix=add_prefix("fused_wq_b_and_wk", prefix),
         )
-        self.wk = ReplicatedLinear(
-            self.hidden_size,
-            self.head_dim,
-            bias=False,
-            quant_config=quant_config,
-            prefix=add_prefix("wk", prefix),
-        )
+        # self.wq_b = ReplicatedLinear(
+        #     self.q_lora_rank,
+        #     self.n_heads * self.head_dim,
+        #     bias=False,
+        #     quant_config=quant_config,
+        #     prefix=add_prefix("wq_b", prefix),
+        # )
+        # self.wk = ReplicatedLinear(
+        #     self.hidden_size,
+        #     self.head_dim,
+        #     bias=False,
+        #     quant_config=quant_config,
+        #     prefix=add_prefix("wk", prefix),
+        # )
         self.k_norm = V32LayerNorm(self.head_dim)
         # NOTE: weight_proj is not quantized
         self.weights_proj = ReplicatedLinear(
@@ -220,7 +227,7 @@ class Indexer(CustomOp):
         enable_dual_stream: bool,
     ):
 
-        if enable_dual_stream:
+        if False and enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
 
@@ -247,14 +254,16 @@ class Indexer(CustomOp):
 
             current_stream.wait_stream(self.alt_stream)
         else:
-            query, _ = self.wq_b(q_lora)
+            combined_input = torch.cat([q_lora, x], dim=-1)
+            query, key = self.fused_wq_b_and_wk(combined_input)[0].split([self.n_heads * self.head_dim, self.head_dim], dim=-1)
+            # query, _ = self.wq_b(q_lora)
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
 
             q_rope, _ = torch.split(
                 query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
             )
 
-            key, _ = self.wk(x)
+            #key, _ = self.wk(x)
             key = self.k_norm(key)
             k_rope, _ = torch.split(
                 key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1

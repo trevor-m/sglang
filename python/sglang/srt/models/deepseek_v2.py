@@ -3190,6 +3190,8 @@ class DeepseekV2ForCausalLM(nn.Module):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
+        fuse_wq_b_and_wk = is_deepseek_nsa(self.config)
+        cached_wq_b_and_wk = {} if fuse_wq_b_and_wk else None
 
         if is_nextn:
             nextn_layer_prefix = f"model.layers.{nextn_layer_id}"
@@ -3361,6 +3363,57 @@ class DeepseekV2ForCausalLM(nn.Module):
                                 )
                                 cached_a_proj.pop(q_a_proj_name)
                                 cached_a_proj.pop(kv_a_proj_name)
+                        elif fuse_wq_b_and_wk and (
+                            "wq_b" in name or "wk" in name
+                        ):
+                            cached_wq_b_and_wk[name] = loaded_weight
+                            wq_b_name = (
+                                name
+                                if "wq_b" in name
+                                else name.replace("wk", "wq_b")
+                            )
+                            wk_name = (
+                                name
+                                if "wk" in name
+                                else name.replace("wq_b", "wk")
+                            )
+
+                            # When both wq_b and wk has been cached, load the fused weight to parameter
+                            if (
+                                wq_b_name in cached_wq_b_and_wk
+                                and wk_name in cached_wq_b_and_wk
+                            ):
+                                wq_b_weight = cached_wq_b_and_wk[wq_b_name]
+                                wk_weight = cached_wq_b_and_wk[wk_name]
+                                # cat_dim = 0
+                                # fused_weight = torch.cat(
+                                #     [wq_b_weight, wk_weight], dim=cat_dim
+                                # )
+                                m1, n1 = wq_b_weight.shape
+                                m2, n2 = wk_weight.shape
+                                fused_weight = torch.zeros(m1 + m2, n1 + n2)
+                                fused_weight[:m1, :n1] = wq_b_weight  # Top-left block
+                                fused_weight[m1:, n1:] = wk_weight    # Bottom-right block
+                                param_name = (
+                                    name.replace(
+                                        "wq_b", "fused_wq_b_and_wk"
+                                    )
+                                    if "wq_b" in name
+                                    else name.replace(
+                                        "wk",
+                                        "fused_wq_b_and_wk",
+                                    )
+                                )
+                                param = params_dict[param_name]
+
+                                weight_loader = getattr(
+                                    param, "weight_loader", default_weight_loader
+                                )
+                                futures.append(
+                                    executor.submit(weight_loader, param, fused_weight)
+                                )
+                                cached_wq_b_and_wk.pop(wq_b_name)
+                                cached_wq_b_and_wk.pop(wk_name)
                         else:
                             if (
                                 "k_scale" in name or "v_scale" in name

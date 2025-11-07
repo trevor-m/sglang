@@ -27,6 +27,7 @@ import ipaddress
 import itertools
 import json
 import logging
+import math
 import os
 import pickle
 import platform
@@ -1997,6 +1998,51 @@ def set_gpu_proc_affinity(
     # set cpu_affinity to current process
     p.cpu_affinity(bind_cpu_ids)
     logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {p.cpu_affinity()}")
+
+
+def set_numa_aware_proc_affinity(
+    gpu_id: int,
+):
+    if not is_cuda():
+        return
+    if not os.path.isdir("/sys/devices/system/node/node1"):
+        # Not a NUMA system
+        return
+    cpu_count = psutil.cpu_count()
+    cpu_affinity = list(range(cpu_count))
+    try:
+        # initialize NVML
+        import pynvml
+        pynvml.nvmlInit()
+
+        # Get the number of bits per ulong
+        c_ulong_bits = ctypes.sizeof(ctypes.c_ulong) * 8
+
+        # Determine how large our cpu set array from NVML needs to be
+        cpu_set_size = math.ceil(cpu_count / c_ulong_bits)
+
+        # Get the optimal CPU affinity for this device according to the NUMA
+        # topology
+        handle = pynvml.nvmlDeviceGetHandleByIndex(gpu_id)
+        affinity_masks = pynvml.nvmlDeviceGetCpuAffinity(handle, cpu_set_size)
+
+        # Convert CPU masks to python list
+        cpu_affinity = []
+        for cpu_id in range(cpu_count):
+            mask_array_index = cpu_id // c_ulong_bits
+            mask_bit_index = cpu_id % c_ulong_bits
+            if affinity_masks[mask_array_index] & (1 << mask_bit_index):
+                cpu_affinity.append(cpu_id)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except:
+            pass  # Ignore shutdown errors
+    
+    pid = os.getpid()
+    process = psutil.Process(pid)
+    process.cpu_affinity(cpu_affinity)
+    logger.info(f"Process {pid} gpu_id {gpu_id} is running on CPUs: {process.cpu_affinity()}")
 
 
 @lru_cache(maxsize=2)

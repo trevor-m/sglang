@@ -183,6 +183,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
+    set_numa_aware_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
 )
@@ -2784,6 +2785,7 @@ def run_scheduler_process(
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, gpu_id
         )
+    set_numa_aware_proc_affinity(gpu_id)
     if (numa_node := server_args.numa_node) is not None:
         numa_bind_to_node(numa_node[gpu_id])
 

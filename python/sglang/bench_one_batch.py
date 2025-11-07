@@ -84,6 +84,7 @@ from sglang.srt.utils import (
     require_mlp_sync,
     require_mlp_tp_gather,
     set_gpu_proc_affinity,
+    set_numa_aware_proc_affinity,
     suppress_other_loggers,
 )
 from sglang.srt.utils.hf_transformers_utils import get_tokenizer
@@ -639,6 +640,8 @@ def latency_test(
         set_gpu_proc_affinity(
             server_args.pp_size, server_args.tp_size, server_args.nnodes, tp_rank
         )
+
+    set_numa_aware_proc_affinity(gpu_id)
 
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")

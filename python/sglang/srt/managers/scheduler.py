@@ -196,6 +196,7 @@ from sglang.srt.utils import (
     point_to_point_pyobj,
     require_mlp_sync,
     set_gpu_proc_affinity,
+    set_numa_aware_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
 )
@@ -2921,6 +2922,8 @@ def run_scheduler_process(
         numa_node := server_args.numa_node
     ) is not None and not envs.SGLANG_NUMA_BIND_V2.get():
         numa_bind_to_node(numa_node[gpu_id])
+    # Automatically set NUMA aware proc affinity
+    set_numa_aware_proc_affinity(gpu_id)
 
     # Set up tracing
     if server_args.enable_trace:

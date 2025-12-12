@@ -163,37 +163,21 @@ class FlashinferDispatcher(BaseDispatcher):
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
 
-        # Handle case where there are no tokens on this DP worker
-        # moe_a2a.dispatch requires at least one token
-        self.has_dummy_token = False
-        topk_ids_current_rank = None
-        if x.shape[0] == 0:
-            self.has_dummy_token = True
-            x = torch.empty(
-                (1, x.shape[1]),
-                dtype=x.dtype,
-                device=x.device,
-            )
-            # -1 will be ignored by flashinfer cutlass moe
-            topk_ids = torch.full(
-                (1, topk_ids.shape[1]), -1, dtype=topk_ids.dtype, device=topk_ids.device
-            )
-            # Dispatch doesn't handle -1 topk id properly. Hack for dispatch with dummy token - will route the dummy token to this rank and requires no transfer.
-            topk_ids_current_rank = torch.full(
-                (1, topk_ids.shape[1]),
-                self.ep_rank * self.num_local_experts,
-                dtype=topk_ids.dtype,
-                device=topk_ids.device,
-            )
-            topk_weights = torch.zeros(
-                (1, topk_weights.shape[1]),
-                dtype=topk_weights.dtype,
-                device=topk_weights.device,
-            )
-
         global_scale = self.quant_config.get("input_global_scale", None)
         if global_scale is not None:
-            x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
+            if x.shape[0] == 0:
+                x_sf = torch.empty(
+                    (0, x.shape[1] // 16),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+                x = torch.empty(
+                    (0, x.shape[1] // 2),
+                    dtype=x.dtype,
+                    device=x.device,
+                )
+            else:
+                x, x_sf = fp4_quantize(x, global_scale, is_sf_swizzled_layout=False)
 
         payloads = []
         payloads.append(x)
@@ -210,8 +194,9 @@ class FlashinferDispatcher(BaseDispatcher):
             if get_dp_global_num_tokens() is not None
             else x.shape[0]
         )
+        logger.info(f"before dispatch, x: {x.shape}, x_sf: {x_sf.shape}, topk_ids: {topk_ids.shape}, topk_weights: {topk_weights.shape}")
         recv_tensors = self.moe_a2a.dispatch(
-            topk_ids_current_rank if self.has_dummy_token else topk_ids,
+            topk_ids,
             payloads,
             self.runtime_max_tokens_per_rank,
             expert_id_payload_index=expert_id_payload_index,
@@ -221,11 +206,13 @@ class FlashinferDispatcher(BaseDispatcher):
             x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
             # TODO: fuse interleave into cutlass moe
             x_sf = nvfp4_block_scale_interleave(x_sf)
+            x_sf = x_sf.view(-1, x_sf.shape[-1])
         else:
             x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
         x = x_recv.view(-1, x_recv.shape[-1])
         topk_ids = topk_ids_recv.view(-1, topk_ids_recv.shape[-1])
         topk_weights = topk_weights_recv.view(-1, topk_weights_recv.shape[-1])
+        logger.info(f"after dispatch, x: {x.shape}, x_sf: {x_sf.shape}, topk_ids: {topk_ids.shape}, topk_weights: {topk_weights.shape} x is nan: {x.isnan().any()}, x_sf is nan: {x_sf.isnan().any()}")
 
         # Provide an output tensor to fused_moe so it writes directly to our buffer
         moe_output = None
@@ -243,6 +230,9 @@ class FlashinferDispatcher(BaseDispatcher):
     def combine(self, combine_input: CombineInput) -> torch.Tensor:
         hidden_states = combine_input.hidden_states
         output_hidden_size = hidden_states.shape[-1]
+        logger.info(f"before combine, hidden_states: {hidden_states.shape} hidden_states is nan: {hidden_states.isnan().any()}")
+        if hidden_states.shape[0] > 0:
+            logger.info(f"before combine, hidden_states value: {hidden_states[0]}")
         hidden_states = self.moe_a2a.combine(
             hidden_states.view(
                 self.ep_size, self.runtime_max_tokens_per_rank, output_hidden_size
@@ -250,16 +240,8 @@ class FlashinferDispatcher(BaseDispatcher):
             self.runtime_max_tokens_per_rank,
             payload_in_workspace=self.payload_in_workspace,
         )
-
-        # Remove dummy token if it was added in dispatch
-        if self.has_dummy_token:
-            hidden_states = torch.empty(
-                0,
-                output_hidden_size,
-                dtype=hidden_states.dtype,
-                device=hidden_states.device,
-            )
-
+        logger.info(f"after combine, hidden_states: {hidden_states.shape} hidden_states is nan: {hidden_states.isnan().any()}")
+        if hidden_states.shape[0] > 0:
+            logger.info(f"after combine, hidden_states value: {hidden_states[0]}")
         del self.runtime_max_tokens_per_rank
-        del self.has_dummy_token
         return hidden_states

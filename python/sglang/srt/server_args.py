@@ -424,6 +424,7 @@ class ServerArgs:
     speculative_ngram_match_type: Literal["BFS", "PROB"] = "BFS"
     speculative_ngram_branch_length: int = 18
     speculative_ngram_capacity: int = 10 * 1000 * 1000
+    speculative_moe_tp_ep_size: Optional[int] = None
 
     # Expert parallelism
     ep_size: int = 1
@@ -3098,6 +3099,12 @@ class ServerArgs:
             default=ServerArgs.speculative_moe_a2a_backend,
             help="Choose the backend for MoE A2A in speculative decoding",
         )
+        parser.add_argument(
+            "--speculative-moe-tp-ep-size",
+            type=int,
+            default=ServerArgs.speculative_moe_tp_ep_size,
+            help="TP/EP-MOE size for EAGLE speculative decoding MoE layers only. Default is None, which means use the same size as the normal MoE layers.",
+        )
 
         # Speculative decoding (ngram)
         parser.add_argument(
@@ -4101,6 +4108,11 @@ class ServerArgs:
             1,
             None,
         }, "moe_dense_tp_size only support 1 and None currently"
+
+        assert self.speculative_moe_tp_ep_size in {
+            1,
+            None,
+        }, "speculative_moe_tp_ep_size only support 1 and None currently"
 
         # Check served model name to not have colon as it is reserved for LoRA adapter syntax
         assert ":" not in self.served_model_name, (

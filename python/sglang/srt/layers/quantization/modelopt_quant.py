@@ -1659,8 +1659,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if hasattr(layer, "gemm1_weights_fp4_shuffled"):
             # This layer was processed with flashinfer TRTLLM - delegate to its own forward
             from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
-
-            return StandardCombineInput(hidden_states=layer.forward(x, topk_output))
+            #assert isinstance(layer, FlashInferFP4MoE), "layer must be a FusedMoE instance"
+            assert False, "shouldn't be here anymore"
+            return StandardCombineInput(hidden_states=layer.run_moe_core(dispatch_output))
 
         if self.enable_flashinfer_cutlass_moe:
             from sglang.srt.layers.moe.token_dispatcher import DispatchOutputChecker

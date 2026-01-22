@@ -46,7 +46,7 @@ from sglang.srt.eplb.expert_location_dispatch import (
     topk_ids_logical_to_physical,
 )
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
-from sglang.srt.layers.moe import get_moe_runner_backend
+from sglang.srt.layers.moe import get_moe_runner_backend, get_moe_a2a_backend
 from sglang.srt.layers.moe.routed_experts_capturer import get_global_experts_capturer
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
@@ -279,7 +279,7 @@ class TopK(MultiPlatformOp):
         elif get_moe_runner_backend().is_triton_kernels():
             output_format = TopKOutputFormat.TRITON_KERNEL
         elif (
-            get_moe_runner_backend().is_flashinfer_trtllm()
+            (get_moe_runner_backend().is_flashinfer_trtllm() and not get_moe_a2a_backend().is_flashinfer())
             or get_moe_runner_backend().is_flashinfer_mxfp4()
         ):
             output_format = TopKOutputFormat.BYPASSED

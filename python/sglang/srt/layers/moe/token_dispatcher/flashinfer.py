@@ -94,8 +94,8 @@ class FlashinferDispatcher(BaseDispatcher):
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
 
-        # TODO: Can other moe runners use payload_in_workspace too?
-        self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        # MOE runner will write to dispatch_output.moe_output
+        self.payload_in_workspace = True
 
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
         self.max_num_tokens = (

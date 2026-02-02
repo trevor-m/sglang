@@ -87,6 +87,11 @@ class GPUWorker:
             dp_size=self.server_args.dp_size,
         )
 
+        # Start hanging threads monitoring
+        from hanging_threads import start_monitoring
+
+        monitoring_thread = start_monitoring(seconds_frozen=60, test_interval=100)
+
         self.pipeline = build_pipeline(self.server_args)
 
         # apply layerwise offload after lora is applied while building LoRAPipeline

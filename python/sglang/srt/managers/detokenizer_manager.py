@@ -418,6 +418,12 @@ def run_detokenizer_process(
     kill_itself_when_parent_died()
     setproctitle.setproctitle("sglang::detokenizer")
     configure_logger(server_args)
+
+    # Start hanging threads monitoring
+    from hanging_threads import start_monitoring
+
+    monitoring_thread = start_monitoring(seconds_frozen=60, test_interval=100)
+
     parent_process = psutil.Process().parent()
 
     try:

@@ -2912,6 +2912,11 @@ def run_scheduler_process(
     configure_logger(server_args, prefix=prefix)
     suppress_other_loggers()
 
+    # Start hanging threads monitoring
+    from hanging_threads import start_monitoring
+
+    monitoring_thread = start_monitoring(seconds_frozen=60, test_interval=100)
+
     # Set cpu affinity to this gpu process
     if get_bool_env_var("SGLANG_SET_CPU_AFFINITY"):
         set_gpu_proc_affinity(

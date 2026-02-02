@@ -301,6 +301,11 @@ class TpModelWorker(BaseTpWorker):
         )[0]
         set_random_seed(self.random_seed)
 
+        # Start hanging threads monitoring
+        from hanging_threads import start_monitoring
+
+        monitoring_thread = start_monitoring(seconds_frozen=60, test_interval=100)
+
         self.enable_overlap = not server_args.disable_overlap_schedule
         self.enable_spec = server_args.speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None

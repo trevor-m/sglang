@@ -166,13 +166,20 @@ class Engine(EngineBase):
         )
         self.tokenizer_manager = tokenizer_manager
         self.template_manager = template_manager
-        self.scheduler_info = scheduler_infos[0]
         self.port_args = port_args
-        self.remote_instance_transfer_engine_info = (
-            parse_remote_instance_transfer_engine_info_from_scheduler_infos(
-                scheduler_infos
+
+        # Handle non-zero rank nodes with SGLANG_BLOCK_NONZERO_RANK_CHILDREN=0
+        # where _launch_subprocesses returns None for scheduler_infos
+        if scheduler_infos is None:
+            self.scheduler_info = None
+            self.remote_instance_transfer_engine_info = None
+        else:
+            self.scheduler_info = scheduler_infos[0]
+            self.remote_instance_transfer_engine_info = (
+                parse_remote_instance_transfer_engine_info_from_scheduler_infos(
+                    scheduler_infos
+                )
             )
-        )
 
         # Initialize ZMQ sockets
         context = zmq.Context(2)

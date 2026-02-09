@@ -613,6 +613,13 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
             self.draft_worker._draft_extend_for_decode(model_worker_batch, batch_output)
+            # Record the synchronization event AFTER draft extend completes,
+            # so that prepare_for_decode in the next iteration's default stream
+            # waits for the full forward (verify + draft extend) to finish
+            # before modifying shared state like req_to_token_pool.
+            forward_done = torch.get_device_module(self.device).Event()
+            forward_done.record()
+            batch_output.next_draft_input.verify_done = forward_done
             return batch_output
 
     def verify(
@@ -676,8 +683,6 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             accept_index,
         ) = verify_input.sample(batch, logits_output)
         new_seq_lens = batch.seq_lens + accept_length
-        verify_done = torch.get_device_module(self.device).Event()
-        verify_done.record()
 
         if not batch.forward_mode.is_idle():
             all_verified_id = predict[accept_index]
@@ -692,10 +697,14 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
             verified_id = torch.empty((0,), device=self.device, dtype=torch.int32)
 
         # Construct the next draft input
+        # NOTE: verify_done is set to None here. The event will be recorded
+        # after _draft_extend_for_decode completes in forward_batch_generation(),
+        # to ensure the default stream waits for the full forward (including
+        # draft extend) before modifying shared state like req_to_token_pool.
         next_draft_input = EagleDraftInput(
             verified_id=verified_id,
             new_seq_lens=new_seq_lens,
-            verify_done=verify_done,
+            verify_done=None,
         )
         return GenerationBatchResult(
             logits_output=logits_output,

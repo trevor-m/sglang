@@ -124,6 +124,9 @@ class EagleDraftInputV2Mixin:
                 num_needed_tokens,
             )
 
+        # Wait for draft extend of the last batch, so req_to_token_pool will not be overwritten by the next batch
+        batch.maybe_wait_draft_extend_for_decode_done()
+
         assign_req_to_token_pool_func(
             batch.req_pool_indices,
             batch.req_to_token_pool.req_to_token,

@@ -650,6 +650,7 @@ class EagleDraftInput(SpecInput, EagleDraftInputV2Mixin):
     future_indices: Optional[FutureIndices] = None
     new_seq_lens: Optional[torch.Tensor] = None
     verify_done: Optional[torch.cuda.Event] = None
+    draft_extend_for_decode_done: Optional[torch.cuda.Event] = None
 
     def __post_init__(self):
         super().__init__(SpecInputType.EAGLE_DRAFT)

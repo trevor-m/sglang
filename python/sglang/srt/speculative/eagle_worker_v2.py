@@ -555,6 +555,11 @@ class EagleDraftWorker(BaseDraftWorker):
                 forward_batch, skip_attn_backend_init=True
             ).logits_output
 
+        batch_result.draft_extend_for_decode_done = torch.get_device_module(
+            self.device
+        ).Event()
+        batch_result.draft_extend_for_decode_done.record()
+
         # Reorganize the spec info for the next batch
         draft_logits_output.next_token_logits = draft_logits_output.next_token_logits[
             select_index

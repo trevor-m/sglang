@@ -2038,6 +2038,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             if draft_input.verify_done is not None:
                 draft_input.verify_done.synchronize()
 
+    def maybe_wait_draft_extend_for_decode_done(self):
+        if self.is_spec_v2:
+            draft_input: EagleDraftInput = self.spec_info
+            if draft_input.draft_extend_for_decode_done is not None:
+                draft_input.draft_extend_for_decode_done.synchronize()
+
     def filter_batch(
         self,
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,

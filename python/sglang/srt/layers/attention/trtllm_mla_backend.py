@@ -542,15 +542,26 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             metadata.seq_lens_k.copy_(seq_lens.to(dtype=torch.int32))
             del seq_lens_sum  # not handle "num_draft_tokens" but we do not need it
         elif forward_mode.is_draft_extend(include_v2=True):
-            accept_length = spec_info.accept_length[:bs]
-            if spec_info.accept_length_cpu:
-                metadata.max_seq_len_q = max(spec_info.accept_length_cpu[:bs]) + 1
-                metadata.sum_seq_lens_q = sum(spec_info.accept_length_cpu[:bs]) + bs
+            if forward_mode.is_draft_extend_v2():
+                # V2: all sequences always have a constant number of query tokens
+                # (num_tokens_per_bs). Use extend_seq_lens set by the CUDA graph
+                # runner rather than computing from accept_length (which is only
+                # correct for V1). Without this, padded CUDA graph entries get
+                # negative seq_lens_k, causing undefined behavior in attention.
+                extend_seq_lens_cpu = spec_info.extend_seq_lens_cpu
+                extend_seq_lens = spec_info.extend_seq_lens_tensor
+                metadata.max_seq_len_q = max(extend_seq_lens_cpu)
+                metadata.sum_seq_lens_q = sum(extend_seq_lens_cpu)
             else:
-                metadata.max_seq_len_q = 1
-                metadata.sum_seq_lens_q = bs
-            # draft_extend uses (accept_length + 1) query tokens per sequence
-            extend_seq_lens = accept_length + 1
+                # V1: variable query length based on accept_length
+                accept_length = spec_info.accept_length[:bs]
+                if spec_info.accept_length_cpu:
+                    metadata.max_seq_len_q = max(spec_info.accept_length_cpu[:bs]) + 1
+                    metadata.sum_seq_lens_q = sum(spec_info.accept_length_cpu[:bs]) + bs
+                else:
+                    metadata.max_seq_len_q = 1
+                    metadata.sum_seq_lens_q = bs
+                extend_seq_lens = accept_length + 1
             metadata.cu_seqlens_q[1:].copy_(
                 torch.cumsum(extend_seq_lens, dim=0, dtype=torch.int32)
             )

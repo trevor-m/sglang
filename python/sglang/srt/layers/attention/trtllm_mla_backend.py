@@ -571,6 +571,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             PAGED_SIZE=self.page_size,
         )
 
+        # Keep forward_decode_metadata in sync so that eager CUDA graph
+        # replay (SGLANG_EAGER_CUDA_GRAPH) can look up the correct metadata
+        # via self.forward_decode_metadata.  Harmless for real graph replay
+        # since graph.replay() never reads this Python-level pointer.
+        self.forward_decode_metadata = metadata
+
     def get_cuda_graph_seq_len_fill_value(self) -> int:
         """Get the fill value for sequence lengths in CUDA graph."""
         return 1

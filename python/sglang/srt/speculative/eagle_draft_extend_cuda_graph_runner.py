@@ -235,7 +235,7 @@ class EAGLEDraftExtendCudaGraphRunner:
             # errors with synchronize() and getting meaningful stack traces.
             out = self._eager_fns[self.bs]()
             self.output_buffers[self.bs] = out
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
         else:
             self.graphs[self.bs].replay()
 

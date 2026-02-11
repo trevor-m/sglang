@@ -178,7 +178,7 @@ class EAGLEDraftCudaGraphRunner:
         if os.environ.get("SGLANG_EAGER_CUDA_GRAPH"):
             out = self._eager_fns[self.bs]()
             self.output_buffers[self.bs] = out
-            torch.cuda.synchronize()
+            # torch.cuda.synchronize()
         else:
             self.graphs[self.bs].replay()
 

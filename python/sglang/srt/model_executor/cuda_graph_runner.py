@@ -866,7 +866,7 @@ class CudaGraphRunner:
         if os.environ.get("SGLANG_EAGER_CUDA_GRAPH"):
             output = self._eager_fns[self.bs]()
             self.output_buffers[graph_key] = output
-            self.device_module.synchronize()
+            # self.device_module.synchronize()
         else:
             self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]

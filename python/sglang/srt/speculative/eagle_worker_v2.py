@@ -680,14 +680,14 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             if _eager_debug:
                 torch.cuda.synchronize()
-                logger.info("EAGER_DEBUG: draft() completed OK")
+                # logger.info("EAGER_DEBUG: draft() completed OK")
 
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
             if _eager_debug:
                 torch.cuda.synchronize()
-                logger.info("EAGER_DEBUG: verify() completed OK")
+                # logger.info("EAGER_DEBUG: verify() completed OK")
 
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
@@ -697,7 +697,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 )
             if _eager_debug:
                 torch.cuda.synchronize()
-                logger.info("EAGER_DEBUG: _draft_extend_for_decode() completed OK")
+                # logger.info("EAGER_DEBUG: _draft_extend_for_decode() completed OK")
 
             return batch_output
 

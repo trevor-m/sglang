@@ -241,6 +241,7 @@ class CudaGraphRunner:
         self.device_module = torch.get_device_module(self.device)
         self.graphs = {}
         self.output_buffers = {}
+        self._eager_fns = {}  # For SGLANG_EAGER_CUDA_GRAPH debug mode
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder
@@ -720,6 +721,8 @@ class CudaGraphRunner:
             )
             return logits_output_or_pp_proxy_tensors
 
+        self._eager_fns[bs] = run_once  # Save for eager debug mode
+
         self.deepep_adapter.capture(is_extend_in_batch=False)
 
         for _ in range(2):
@@ -859,7 +862,13 @@ class CudaGraphRunner:
             graph_key = f"{get_current_stream_idx()}_{self.bs}"
         else:
             graph_key = self.bs
-        self.graphs[graph_key].replay()
+
+        if os.environ.get("SGLANG_EAGER_CUDA_GRAPH"):
+            output = self._eager_fns[self.bs]()
+            self.output_buffers[graph_key] = output
+            self.device_module.synchronize()
+        else:
+            self.graphs[graph_key].replay()
         output = self.output_buffers[graph_key]
 
         if isinstance(output, LogitsProcessorOutput):

@@ -1,5 +1,6 @@
 import contextlib
 import logging
+import os
 import time
 from typing import List, Optional, Tuple
 
@@ -669,21 +670,35 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     topk=self.topk,
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
+            _eager_debug = os.environ.get("SGLANG_EAGER_CUDA_GRAPH")
+
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 verify_input: EagleVerifyInput = self.draft_worker.draft(
                     model_worker_batch
                 )
+            if _eager_debug:
+                torch.cuda.synchronize()
+                logger.info("EAGER_DEBUG: draft() completed OK")
+
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
+            if _eager_debug:
+                torch.cuda.synchronize()
+                logger.info("EAGER_DEBUG: verify() completed OK")
+
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
                 self.draft_worker._draft_extend_for_decode(
                     model_worker_batch, batch_output
                 )
+            if _eager_debug:
+                torch.cuda.synchronize()
+                logger.info("EAGER_DEBUG: _draft_extend_for_decode() completed OK")
+
             return batch_output
 
     def verify(self, batch: ModelWorkerBatch):

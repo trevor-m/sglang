@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import bisect
+import os
 from typing import TYPE_CHECKING, Callable
 
 import torch
@@ -45,6 +46,7 @@ class EAGLEDraftCudaGraphRunner:
             self.model_runner = model_runner = eagle_worker.model_runner
         self.graphs = {}
         self.output_buffers = {}
+        self._eager_fns = {}  # For SGLANG_EAGER_CUDA_GRAPH debug mode
         self.enable_torch_compile = model_runner.server_args.enable_torch_compile
         self.disable_padding = model_runner.server_args.disable_cuda_graph_padding
         self.require_gathered_buffer = require_gathered_buffer(model_runner.server_args)
@@ -173,7 +175,12 @@ class EAGLEDraftCudaGraphRunner:
         return out
 
     def _replay(self, forward_batch: ForwardBatch):
-        self.graphs[self.bs].replay()
+        if os.environ.get("SGLANG_EAGER_CUDA_GRAPH"):
+            out = self._eager_fns[self.bs]()
+            self.output_buffers[self.bs] = out
+            torch.cuda.synchronize()
+        else:
+            self.graphs[self.bs].replay()
 
     def capture(self):
         CudaGraphRunner.capture(self)
@@ -299,6 +306,8 @@ class EAGLEDraftCudaGraphRunner:
             forward_batch.out_cache_loc = output_cache_loc_backup
             forward_batch.spec_info.hidden_states = hidden_states_backup
             return ret
+
+        self._eager_fns[num_seqs] = run_once  # Save for eager debug mode
 
         self.deepep_adapter.capture(is_extend_in_batch=False)
 

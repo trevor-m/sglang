@@ -838,6 +838,18 @@ class MHATokenToKVPool(KVCache):
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def get_kv_buffers(self):
+        """Return flat list of KV buffer tensors in same order as get_contiguous_buf_infos."""
+        k_bufs = [
+            self._get_key_buffer(i)
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        v_bufs = [
+            self._get_value_buffer(i)
+            for i in range(self.start_layer, self.start_layer + self.layer_num)
+        ]
+        return k_bufs + v_bufs
+
     def get_cpu_copy(self, indices):
         torch.cuda.synchronize()
         kv_cache_cpu = []
@@ -1410,6 +1422,10 @@ class MLATokenToKVPool(KVCache):
             self.kv_buffer[i][0].nbytes * self.page_size for i in range(self.layer_num)
         ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
+
+    def get_kv_buffers(self):
+        """Return flat list of KV buffer tensors in same order as get_contiguous_buf_infos."""
+        return [self.kv_buffer[i] for i in range(self.layer_num)]
 
     def get_key_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:

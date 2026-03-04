@@ -12,6 +12,7 @@ from typing import Dict, List, Optional, Set
 import numpy as np
 import numpy.typing as npt
 import requests
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.common.conn import (
@@ -126,6 +127,49 @@ class TransferStatus:
         return self.is_failure
 
 
+class StagingBuffer:
+    """Pre-allocated GPU staging buffer for NIXL transfers."""
+
+    def __init__(self, size_bytes: int, device: int):
+        self.buffer = torch.empty(
+            size_bytes, dtype=torch.uint8, device=f"cuda:{device}"
+        )
+        self.base_ptr = self.buffer.data_ptr()
+        self.size = size_bytes
+        self.offset = 0
+        self.stream = torch.cuda.Stream(device=device)
+
+    def reset(self):
+        self.offset = 0
+
+    def copy_pages(
+        self, kv_buf: torch.Tensor, page_start: int, page_count: int, page_size: int
+    ) -> tuple[int, int]:
+        """Copy contiguous pages from KV buffer to staging buffer.
+        Returns (staging_ptr, num_bytes)."""
+        token_start = page_start * page_size
+        token_end = token_start + page_count * page_size
+        src_slice = kv_buf[token_start:token_end]
+        nbytes = src_slice.numel() * src_slice.element_size()
+
+        if self.offset + nbytes > self.size:
+            raise RuntimeError(
+                f"Staging buffer full: need {nbytes} bytes at offset {self.offset}, capacity {self.size}"
+            )
+
+        dst_view = self.buffer[self.offset : self.offset + nbytes]
+        with torch.cuda.stream(self.stream):
+            dst_view.copy_(src_slice.reshape(-1).view(torch.uint8))
+
+        ptr = self.base_ptr + self.offset
+        self.offset += nbytes
+        return ptr, nbytes
+
+    def synchronize(self):
+        """Wait for all copies to complete."""
+        self.stream.synchronize()
+
+
 class NixlKVManager(CommonKVManager):
     def __init__(
         self,
@@ -135,6 +179,21 @@ class NixlKVManager(CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.kv_buffers = args.kv_buffers
+
+        # Staging buffer setup (sender-side only)
+        staging_size_mb = envs.SGLANG_NIXL_STAGING_BUFFER_SIZE_MB.get()
+        if staging_size_mb > 0 and disaggregation_mode == DisaggregationMode.PREFILL:
+            self.staging_buffer = StagingBuffer(
+                staging_size_mb * 1024 * 1024, args.gpu_id
+            )
+            self._last_staging_handles: list = []
+            logger.info(
+                f"Using staging buffer of {staging_size_mb} MB for NIXL transfers"
+            )
+        else:
+            self.staging_buffer = None
+
         try:
             from nixl._api import nixl_agent
         except ImportError as e:
@@ -284,15 +343,31 @@ class NixlKVManager(CommonKVManager):
         pass
 
     def register_buffer_to_engine(self):
-        kv_addrs = []
-        for kv_data_ptr, kv_data_len in zip(
-            self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-        ):
-            kv_addrs.append((kv_data_ptr, kv_data_len, self.kv_args.gpu_id, ""))
-        self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM")
-        logger.debug(f"Register kv tensors, len(kv_addr)= {len(kv_addrs)}")
-        if not self.kv_descs:
-            raise Exception("NIXL memory registration failed for kv tensors")
+        if self.staging_buffer is not None:
+            # Register staging buffer instead of KV cache
+            staging_addrs = [
+                (
+                    self.staging_buffer.base_ptr,
+                    self.staging_buffer.size,
+                    self.kv_args.gpu_id,
+                    "",
+                )
+            ]
+            self.kv_descs = self.agent.register_memory(staging_addrs, "VRAM")
+            logger.debug(f"Register staging buffer, size= {self.staging_buffer.size}")
+            if not self.kv_descs:
+                raise Exception("NIXL memory registration failed for staging buffer")
+        else:
+            kv_addrs = []
+            for kv_data_ptr, kv_data_len in zip(
+                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+            ):
+                kv_addrs.append((kv_data_ptr, kv_data_len, self.kv_args.gpu_id, ""))
+            self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM")
+            logger.debug(f"Register kv tensors, len(kv_addr)= {len(kv_addrs)}")
+            if not self.kv_descs:
+                raise Exception("NIXL memory registration failed for kv tensors")
+
         aux_addrs = []
         for aux_data_ptr, aux_data_len in zip(
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
@@ -310,6 +385,28 @@ class NixlKVManager(CommonKVManager):
             return
         self.decode_kv_args_table[agent_name] = decode_kv_args
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
+
+    def _wait_staging_handles(self):
+        """Wait for all in-flight NIXL transfers that use staging buffer data."""
+        for handle in self._last_staging_handles:
+            while self.agent.check_xfer_state(handle) not in ("DONE", "ERR"):
+                pass
+        self._last_staging_handles.clear()
+
+    def _get_layer_buffers(self, layers_current_pp_stage: int) -> list | None:
+        """Get KV buffer tensors matching layers_params order."""
+        if not self.kv_buffers:
+            return None
+        if self.is_mla_backend:
+            return self.kv_buffers[:layers_current_pp_stage]
+        else:
+            num_kv_layers = len(self.kv_args.kv_data_ptrs) // 2
+            return (
+                self.kv_buffers[:layers_current_pp_stage]
+                + self.kv_buffers[
+                    num_kv_layers : num_kv_layers + layers_current_pp_stage
+                ]
+            )
 
     def send_kvcache(
         self,
@@ -362,13 +459,44 @@ class NixlKVManager(CommonKVManager):
 
         src_addrs = []
         dst_addrs = []
-        for src_ptr, dst_ptr, item_len in layers_params:
-            for prefill_index, decode_index in zip(prefill_kv_blocks, dst_kv_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                src_addrs.append((src_addr, length, self.kv_args.gpu_id))
-                dst_addrs.append((dst_addr, length, dst_gpu_id))
+
+        layer_buffers = self._get_layer_buffers(layers_current_pp_stage)
+
+        if self.staging_buffer is not None and layer_buffers is not None:
+            # === STAGING BUFFER PATH ===
+            # 1. Wait for previous transfer to finish reading from staging buffer
+            self._wait_staging_handles()
+            self.staging_buffer.reset()
+
+            # 2. Copy KV pages to staging buffer
+            page_size = self.kv_args.page_size
+            for layer_idx, (_, dst_ptr, item_len) in enumerate(layers_params):
+                kv_buf = layer_buffers[layer_idx]
+                for prefill_index, decode_index in zip(
+                    prefill_kv_blocks, dst_kv_blocks
+                ):
+                    page_start = int(prefill_index[0])
+                    page_count = len(prefill_index)
+                    staging_ptr, nbytes = self.staging_buffer.copy_pages(
+                        kv_buf, page_start, page_count, page_size
+                    )
+                    src_addrs.append((staging_ptr, nbytes, self.kv_args.gpu_id))
+                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                    dst_addrs.append((dst_addr, nbytes, dst_gpu_id))
+
+            # 3. Synchronize CUDA copy stream before NIXL transfer
+            self.staging_buffer.synchronize()
+        else:
+            # === ORIGINAL DIRECT PATH ===
+            for src_ptr, dst_ptr, item_len in layers_params:
+                for prefill_index, decode_index in zip(
+                    prefill_kv_blocks, dst_kv_blocks
+                ):
+                    src_addr = src_ptr + int(prefill_index[0]) * item_len
+                    dst_addr = dst_ptr + int(decode_index[0]) * item_len
+                    length = item_len * len(prefill_index)
+                    src_addrs.append((src_addr, length, self.kv_args.gpu_id))
+                    dst_addrs.append((dst_addr, length, dst_gpu_id))
 
         logger.debug(
             f"len(src_addrs): before group: {len(prefill_kv_indices)}, after group: {len(src_addrs)}"
@@ -388,6 +516,11 @@ class NixlKVManager(CommonKVManager):
         state = self.agent.transfer(xfer_handle)
         if state == "ERR":
             raise Exception("KVSender failed to post transfer")
+
+        # Track handle for staging buffer lifecycle
+        if self.staging_buffer is not None:
+            self._last_staging_handles.append(xfer_handle)
+
         return xfer_handle
 
     def send_kvcache_slice(

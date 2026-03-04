@@ -37,6 +37,8 @@ class KVArgs:
     prefill_start_layer: int
     # for system dp
     system_dp_rank: int
+    # Actual torch.Tensor buffers (same order as kv_data_ptrs) for staging buffer
+    kv_buffers: Optional[List] = None
 
 
 class KVPoll:

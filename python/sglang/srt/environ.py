@@ -236,7 +236,7 @@ class Envs:
     SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
     SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
     SGLANG_NIXL_SEND_STAGING_BUFFER_SIZE_MB = EnvInt(0)
-    SGLANG_NIXL_RECV_STAGING_BUFFER_SIZE_MB = EnvInt(0)
+    SGLANG_NIXL_RECV_STAGING_BUFFER_SIZE_MB = EnvInt(512)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.

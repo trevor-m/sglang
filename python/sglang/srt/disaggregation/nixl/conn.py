@@ -31,6 +31,90 @@ logger = logging.getLogger(__name__)
 GUARD = "NixlMsgGuard".encode("ascii")
 
 
+class ReceiveStagingBuffer:
+    """Pre-allocated GPU staging buffer for receiving NIXL transfers on decode side."""
+
+    def __init__(self, size_mb: int, kv_args: KVArgs, kv_buffers: list, device: int):
+        import torch
+
+        num_kv_ptrs = len(kv_args.kv_data_ptrs)
+        item_len = kv_args.kv_item_lens[0]  # uniform across layers
+        page_size = kv_args.page_size
+
+        total_bytes = size_mb * 1024 * 1024
+        bytes_per_ptr = total_bytes // num_kv_ptrs
+        self.max_staging_pages = bytes_per_ptr // item_len
+        self.page_size = page_size
+        self.item_len = item_len
+        self.num_kv_ptrs = num_kv_ptrs
+
+        logger.info(
+            f"Receive staging buffer: {size_mb}MB, {num_kv_ptrs} ptrs, "
+            f"{self.max_staging_pages} pages/ptr, item_len={item_len}"
+        )
+
+        # Per-layer staging tensors matching KV buffer shapes (smaller first dim)
+        num_staging_tokens = self.max_staging_pages * page_size
+        self.staging_layers = []
+        for kv_buf in kv_buffers:
+            staging = torch.empty(
+                num_staging_tokens,
+                *kv_buf.shape[1:],
+                dtype=kv_buf.dtype,
+                device=f"cuda:{device}",
+            )
+            self.staging_layers.append(staging)
+
+        # Pointers for NIXL registration and _register_kv_args
+        self.layer_ptrs = [t.data_ptr() for t in self.staging_layers]
+        self.layer_lens = [t.numel() * t.element_size() for t in self.staging_layers]
+
+        # Page allocator (thread-safe)
+        self._free_pages = list(range(self.max_staging_pages))
+        self._lock = threading.Lock()
+
+        # Stream for async copy-back
+        self.stream = torch.cuda.Stream(device=device)
+
+    def alloc_pages(self, n: int) -> list[int]:
+        with self._lock:
+            if len(self._free_pages) < n:
+                raise RuntimeError(
+                    f"Receive staging buffer full: need {n} pages, "
+                    f"only {len(self._free_pages)} available"
+                )
+            allocated = self._free_pages[:n]
+            self._free_pages = self._free_pages[n:]
+            return allocated
+
+    def release_pages(self, pages: list[int]):
+        with self._lock:
+            self._free_pages.extend(pages)
+
+    def copy_to_kv_cache(
+        self, kv_buffers: list, staging_indices: list[int], kv_indices, page_size: int
+    ):
+        """Copy received data from staging pages to actual KV cache pages. Synchronous."""
+        import torch
+
+        device = self.staging_layers[0].device
+        staging_pages = torch.tensor(staging_indices, dtype=torch.long, device=device)
+        kv_pages = torch.tensor(kv_indices, dtype=torch.long, device=device)
+        offsets = torch.arange(page_size, dtype=torch.long, device=device)
+
+        staging_tokens = (
+            staging_pages[:, None] * page_size + offsets[None, :]
+        ).reshape(-1)
+        kv_tokens = (kv_pages[:, None] * page_size + offsets[None, :]).reshape(-1)
+
+        with torch.cuda.stream(self.stream):
+            for layer_idx in range(len(kv_buffers)):
+                kv_buffers[layer_idx][kv_tokens] = self.staging_layers[layer_idx][
+                    staging_tokens
+                ]
+        self.stream.synchronize()
+
+
 @dataclasses.dataclass
 class TransferInfo:
     """Contains indices for a transfer, sent by KVReceiver. Received by prefill bootstrap thread."""
@@ -182,7 +266,7 @@ class NixlKVManager(CommonKVManager):
         self.kv_buffers = args.kv_buffers
 
         # Staging buffer setup (sender-side only)
-        staging_size_mb = envs.SGLANG_NIXL_STAGING_BUFFER_SIZE_MB.get()
+        staging_size_mb = envs.SGLANG_NIXL_SEND_STAGING_BUFFER_SIZE_MB.get()
         if staging_size_mb > 0 and disaggregation_mode == DisaggregationMode.PREFILL:
             self.staging_buffer = StagingBuffer(
                 staging_size_mb * 1024 * 1024, args.gpu_id
@@ -195,14 +279,41 @@ class NixlKVManager(CommonKVManager):
             self.staging_buffer = None
 
         try:
-            from nixl._api import nixl_agent
+            from nixl._api import nixl_agent, nixl_agent_config
         except ImportError as e:
             raise ImportError(
                 "Please install NIXL by following the instructions at "
                 "https://github.com/ai-dynamo/nixl/blob/main/README.md "
                 "to run SGLang with NixlTransferEngine."
             ) from e
-        self.agent = nixl_agent(str(uuid.uuid4()))
+
+        backend = envs.SGLANG_DISAGGREGATION_NIXL_BACKEND.get()
+        agent_config = nixl_agent_config(
+            backends=[backend],
+            num_threads=(8 if disaggregation_mode == DisaggregationMode.PREFILL else 0),
+        )
+        self.agent = nixl_agent(str(uuid.uuid4()), agent_config)
+
+        available_plugins = self.agent.get_plugin_list()
+        if backend not in available_plugins:
+            raise ValueError(
+                f"NIXL backend '{backend}' not found. Available: {available_plugins}. "
+                f"Please install the required NIXL plugin or choose from: {available_plugins}"
+            )
+        logger.info(f"NIXL KVManager initialized with backend: {backend}")
+
+        # Receive staging buffer setup (decode side)
+        recv_staging_size_mb = envs.SGLANG_NIXL_RECV_STAGING_BUFFER_SIZE_MB.get()
+        if (
+            recv_staging_size_mb > 0
+            and disaggregation_mode == DisaggregationMode.DECODE
+        ):
+            self.recv_staging_buffer = ReceiveStagingBuffer(
+                recv_staging_size_mb, args, args.kv_buffers, args.gpu_id
+            )
+        else:
+            self.recv_staging_buffer = None
+
         self.register_buffer_to_engine()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -344,7 +455,7 @@ class NixlKVManager(CommonKVManager):
 
     def register_buffer_to_engine(self):
         if self.staging_buffer is not None:
-            # Register staging buffer instead of KV cache
+            # Prefill: register sender staging buffer instead of KV cache
             staging_addrs = [
                 (
                     self.staging_buffer.base_ptr,
@@ -357,17 +468,33 @@ class NixlKVManager(CommonKVManager):
             logger.debug(f"Register staging buffer, size= {self.staging_buffer.size}")
             if not self.kv_descs:
                 raise Exception("NIXL memory registration failed for staging buffer")
+        elif self.recv_staging_buffer is not None:
+            # Decode: register receiver staging buffer instead of KV cache
+            kv_addrs = [
+                (ptr, length, self.kv_args.gpu_id, "")
+                for ptr, length in zip(
+                    self.recv_staging_buffer.layer_ptrs,
+                    self.recv_staging_buffer.layer_lens,
+                )
+            ]
+            self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM")
+            logger.debug(f"Register recv staging buffer, len(kv_addr)= {len(kv_addrs)}")
+            if not self.kv_descs:
+                raise Exception(
+                    "NIXL memory registration failed for recv staging buffer"
+                )
         else:
-            kv_addrs = []
-            for kv_data_ptr, kv_data_len in zip(
-                self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
-            ):
-                kv_addrs.append((kv_data_ptr, kv_data_len, self.kv_args.gpu_id, ""))
+            # Default: register KV cache directly
+            kv_addrs = [
+                (kv_data_ptr, kv_data_len, self.kv_args.gpu_id, "")
+                for kv_data_ptr, kv_data_len in zip(
+                    self.kv_args.kv_data_ptrs, self.kv_args.kv_data_lens
+                )
+            ]
             self.kv_descs = self.agent.register_memory(kv_addrs, "VRAM")
             logger.debug(f"Register kv tensors, len(kv_addr)= {len(kv_addrs)}")
             if not self.kv_descs:
                 raise Exception("NIXL memory registration failed for kv tensors")
-
         aux_addrs = []
         for aux_data_ptr, aux_data_len in zip(
             self.kv_args.aux_data_ptrs, self.kv_args.aux_data_lens
@@ -896,6 +1023,8 @@ class NixlKVReceiver(CommonKVReceiver):
     ):
         self.started_transfer = False
         self.conclude_state = None
+        self.staging_indices = None  # Staging pages allocated for this request
+        self.real_kv_indices = None  # Original KV indices for copy-back
         super().__init__(mgr, bootstrap_addr, bootstrap_room, prefill_dp_rank)
 
         # Track this room with its bootstrap address for heartbeat monitoring
@@ -917,6 +1046,14 @@ class NixlKVReceiver(CommonKVReceiver):
             )
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             return
+
+        # Staging: allocate staging pages and remap indices
+        if self.kv_mgr.recv_staging_buffer is not None and kv_indices.size > 0:
+            self.real_kv_indices = kv_indices.copy()
+            self.staging_indices = self.kv_mgr.recv_staging_buffer.alloc_pages(
+                len(kv_indices)
+            )
+            kv_indices = np.array(self.staging_indices, dtype=np.int32)
 
         for bootstrap_info in self.bootstrap_infos:
             logger.debug(
@@ -977,7 +1114,21 @@ class NixlKVReceiver(CommonKVReceiver):
                 logger.error(
                     f"Transfer for room {self.bootstrap_room} failed due to node failure"
                 )
+                # Release staging pages on failure
+                if self.staging_indices is not None:
+                    self.kv_mgr.recv_staging_buffer.release_pages(self.staging_indices)
+                    self.staging_indices = None
             else:
+                # Copy from staging to KV cache before reporting success
+                if self.staging_indices is not None:
+                    self.kv_mgr.recv_staging_buffer.copy_to_kv_cache(
+                        self.kv_mgr.kv_buffers,
+                        self.staging_indices,
+                        self.real_kv_indices,
+                        self.kv_mgr.kv_args.page_size,
+                    )
+                    self.kv_mgr.recv_staging_buffer.release_pages(self.staging_indices)
+                    self.staging_indices = None
                 self.conclude_state = KVPoll.Success
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
@@ -986,9 +1137,12 @@ class NixlKVReceiver(CommonKVReceiver):
     def _register_kv_args(self):
         for bootstrap_info in self.bootstrap_infos:
             sock, lock = self._connect_to_bootstrap_server(bootstrap_info)
-            packed_kv_data_ptrs = b"".join(
-                struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.kv_data_ptrs
-            )
+            # Use staging buffer pointers if available
+            if self.kv_mgr.recv_staging_buffer is not None:
+                kv_ptrs = self.kv_mgr.recv_staging_buffer.layer_ptrs
+            else:
+                kv_ptrs = self.kv_mgr.kv_args.kv_data_ptrs
+            packed_kv_data_ptrs = b"".join(struct.pack("Q", ptr) for ptr in kv_ptrs)
             packed_aux_data_ptrs = b"".join(
                 struct.pack("Q", ptr) for ptr in self.kv_mgr.kv_args.aux_data_ptrs
             )
@@ -1010,6 +1164,11 @@ class NixlKVReceiver(CommonKVReceiver):
                         str(self.kv_mgr.kv_args.kv_item_lens[0]).encode("ascii"),
                     ]
                 )
+
+    def clear(self):
+        if self.staging_indices is not None:
+            self.kv_mgr.recv_staging_buffer.release_pages(self.staging_indices)
+            self.staging_indices = None
 
     def failure_exception(self):
         raise RuntimeError("NIXL KVReceiver Exception")

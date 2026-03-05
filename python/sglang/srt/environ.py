@@ -233,7 +233,10 @@ class Envs:
     SGLANG_DISAGGREGATION_HEARTBEAT_INTERVAL = EnvFloat(5.0)
     SGLANG_DISAGGREGATION_HEARTBEAT_MAX_FAILURE = EnvInt(2)
     SGLANG_DISAGGREGATION_WAITING_TIMEOUT = EnvInt(300)
-    SGLANG_NIXL_STAGING_BUFFER_SIZE_MB = EnvInt(512)  # 0 = disabled, >0 = staging buffer size in MB
+    SGLANG_DISAGGREGATION_NIXL_BACKEND = EnvStr("UCX")
+    SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER = EnvBool(False)
+    SGLANG_NIXL_SEND_STAGING_BUFFER_SIZE_MB = EnvInt(0)
+    SGLANG_NIXL_RECV_STAGING_BUFFER_SIZE_MB = EnvInt(0)
 
     # Scheduler: others:
     SGLANG_EMPTY_CACHE_INTERVAL = EnvFloat(-1)  # in seconds. Set if you observe high memory accumulation over a long serving period.

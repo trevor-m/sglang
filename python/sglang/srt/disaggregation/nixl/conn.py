@@ -1086,6 +1086,8 @@ class NixlKVReceiver(CommonKVReceiver):
             return self.conclude_state
         status = self.kv_mgr.check_status(self.bootstrap_room)
         if status in (KVPoll.Success, KVPoll.Failed):
+            if status == KVPoll.Failed:
+                self._release_staging_pages()
             self.conclude_state = status
             return status
         if not self.started_transfer:
@@ -1100,6 +1102,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 self.bootstrap_room,
                 f"Request {self.bootstrap_room} timed out after {elapsed:.1f}s in KVPoll.WaitingForInput",
             )
+            self._release_staging_pages()
             self.conclude_state = KVPoll.Failed
             return KVPoll.Failed
 
@@ -1114,10 +1117,7 @@ class NixlKVReceiver(CommonKVReceiver):
                 logger.error(
                     f"Transfer for room {self.bootstrap_room} failed due to node failure"
                 )
-                # Release staging pages on failure
-                if self.staging_indices is not None:
-                    self.kv_mgr.recv_staging_buffer.release_pages(self.staging_indices)
-                    self.staging_indices = None
+                self._release_staging_pages()
             else:
                 # Copy from staging to KV cache before reporting success
                 if self.staging_indices is not None:
@@ -1127,8 +1127,7 @@ class NixlKVReceiver(CommonKVReceiver):
                         self.real_kv_indices,
                         self.kv_mgr.kv_args.page_size,
                     )
-                    self.kv_mgr.recv_staging_buffer.release_pages(self.staging_indices)
-                    self.staging_indices = None
+                    self._release_staging_pages()
                 self.conclude_state = KVPoll.Success
             del self.kv_mgr.transfer_statuses[self.bootstrap_room]
             return self.conclude_state  # type: ignore
@@ -1165,10 +1164,13 @@ class NixlKVReceiver(CommonKVReceiver):
                     ]
                 )
 
-    def clear(self):
+    def _release_staging_pages(self):
         if self.staging_indices is not None:
             self.kv_mgr.recv_staging_buffer.release_pages(self.staging_indices)
             self.staging_indices = None
+
+    def clear(self):
+        self._release_staging_pages()
 
     def failure_exception(self):
         raise RuntimeError("NIXL KVReceiver Exception")

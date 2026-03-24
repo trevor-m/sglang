@@ -1997,6 +1997,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
             return StandardCombineInput(hidden_states=output)
 
+        if self.enable_flashinfer_cutedsl_moe:
+            from sglang.srt.layers.moe.token_dispatcher import (
+                DispatchOutputChecker,
+                StandardCombineInput,
+            )
+
+            if DispatchOutputChecker.format_is_flashinfer(dispatch_output):
+                return self._apply_cutedsl_flashinfer(
+                    layer, dispatch_output, moe_runner_config
+                )
+            # Non-flashinfer cutedsl paths go through EPMoE.forward_flashinfer_cutedsl
+
         from sglang.srt.layers.moe.cutlass_moe import cutlass_moe_fp4
 
         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
@@ -2068,3 +2080,46 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             ),
         )
         return out
+
+    def _apply_cutedsl_flashinfer(
+        self,
+        layer,
+        dispatch_output,
+        moe_runner_config,
+    ):
+        """Apply CuteDSL MoE with FlashInfer A2A dispatch output.
+
+        Uses flashinfer's cute_dsl_fused_moe_nvfp4 which handles the entire
+        pipeline: moe_sort → gather GEMM1 + SwiGLU → GEMM2 + finalize
+        (unpermute + scale). This mirrors the tekit CuteDslFusedMoE.run_moe_nvfp4
+        flow and avoids any manual Python permutation.
+        """
+        from flashinfer.fused_moe.cute_dsl import cute_dsl_fused_moe_nvfp4
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        x = dispatch_output.hidden_states
+        x_sf = dispatch_output.hidden_states_scale
+        topk_output = dispatch_output.topk_output
+        moe_output = dispatch_output.moe_output  # pre-allocated workspace or None
+
+        output = cute_dsl_fused_moe_nvfp4(
+            x=x,
+            x_sf=x_sf,
+            token_selected_experts=topk_output.topk_ids,
+            token_final_scales=topk_output.topk_weights,
+            w1_weight=layer.w13_weight,
+            w1_weight_sf=layer.w13_blockscale_swizzled,
+            w1_alpha=layer.g1_alphas,
+            fc2_input_scale=layer.w2_input_scale_quant,
+            w2_weight=layer.w2_weight,
+            w2_weight_sf=layer.w2_blockscale_swizzled,
+            w2_alpha=layer.g2_alphas,
+            num_experts=layer.num_experts,
+            top_k=topk_output.topk_ids.shape[1],
+            num_local_experts=layer.num_local_experts,
+            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+            moe_output=moe_output,
+        )
+
+        return StandardCombineInput(hidden_states=output)

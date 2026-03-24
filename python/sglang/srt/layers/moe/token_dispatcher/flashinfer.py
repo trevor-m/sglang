@@ -95,8 +95,14 @@ class FlashinferDispatcher(BaseDispatcher):
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
 
-        # TODO: Can other moe runners use payload_in_workspace too?
-        self.payload_in_workspace = get_moe_runner_backend().is_flashinfer_cutlass()
+        # Both flashinfer_cutlass and flashinfer_cutedsl support writing MoE
+        # output directly into the alltoall workspace for efficient combine.
+        self.payload_in_workspace = (
+            get_moe_runner_backend().is_flashinfer_cutlass()
+            or get_moe_runner_backend().is_flashinfer_cutedsl()
+        )
+        # CuteDSL expects non-interleaved input scales (it handles layout internally)
+        self.interleave_input_sf = not get_moe_runner_backend().is_flashinfer_cutedsl()
 
         # TODO: Can this be a server arg and shared with deepep/mooncakeep?
         self.max_num_tokens = (
@@ -225,7 +231,8 @@ class FlashinferDispatcher(BaseDispatcher):
             x_recv, x_sf_recv, topk_ids_recv, topk_weights_recv = recv_tensors
             x_sf = x_sf_recv.view(-1, x_sf_recv.shape[-1])
             # TODO: fuse interleave into cutlass moe
-            x_sf = nvfp4_block_scale_interleave(x_sf)
+            if self.interleave_input_sf:
+                x_sf = nvfp4_block_scale_interleave(x_sf)
         else:
             x_recv, topk_ids_recv, topk_weights_recv = recv_tensors
         x = x_recv.view(-1, x_recv.shape[-1])

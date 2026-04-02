@@ -1490,6 +1490,10 @@ class RowParallelLinear(LinearBase):
                 param.load_row_parallel_weight(loaded_weight)
 
     def forward(self, input_, skip_all_reduce=False):
+        import torch.cuda.nvtx as nvtx
+
+        nvtx.range_push("RowParallel::forward")
+
         if self.input_is_parallel:
             input_parallel = input_
         else:
@@ -1503,11 +1507,14 @@ class RowParallelLinear(LinearBase):
         # Only fuse bias add into GEMM for rank 0 (this ensures that
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
+        nvtx.range_push("quant_method_apply")
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):
             output_parallel = self.quant_method.apply(self, input_parallel, bias=bias_)
+        nvtx.range_pop()
 
+        nvtx.range_push("reduce")
         if self.reduce_results and self.tp_size > 1 and not skip_all_reduce:
             if self.use_dp_attention_reduce:
                 output = get_attention_tp_group().all_reduce(output_parallel)
@@ -1515,9 +1522,11 @@ class RowParallelLinear(LinearBase):
                 output = tensor_model_parallel_all_reduce(output_parallel)
         else:
             output = output_parallel
+        nvtx.range_pop()
 
         output_bias = self.bias if self.skip_bias_add else None
 
+        nvtx.range_pop()  # RowParallel::forward
         return output, output_bias
 
     def extra_repr(self) -> str:

@@ -483,12 +483,19 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    import torch.cuda.nvtx as nvtx
+
+    nvtx.range_push("flashinfer_fp8_linear")
     assert input_scale is None
 
+    nvtx.range_push("input_view")
     input_2d = input.view(-1, input.shape[-1])
+    nvtx.range_pop()
+
     backend = _get_flashinfer_groupwise_backend()
     # TRTLLM backend requires K dimension >= 256.
     if backend == "trtllm" and input_2d.shape[1] < 256:
+        nvtx.range_pop()
         return triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )
@@ -497,9 +504,11 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
 
     # TRTLLM uses the existing SGLang column-major scale layout.
     # CUTLASS with scale_major_mode="MN" expects (k//block_k, m), so we normalize below.
+    nvtx.range_push("quant")
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d, block_size[1], column_major_scales=(backend == "trtllm")
     )
+    nvtx.range_pop()
     if backend == "cutlass":
         block_n, block_k = block_size
         m, k = input_2d.shape
@@ -533,6 +542,7 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             f"got {weight_scale.dtype}."
         )
     # TRTLLM path continues using the original quantized scale layout.
+    nvtx.range_push("gemm")
     output = gemm_fp8_nt_groupwise(
         q_input,
         weight,
@@ -540,11 +550,17 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
         weight_scale,
         out_dtype=input_2d.dtype,
     )
+    nvtx.range_pop()
 
     if bias is not None:
         output += bias
 
-    return output.to(dtype=input_2d.dtype).view(*output_shape)
+    nvtx.range_push("output_cast_view")
+    result = output.to(dtype=input_2d.dtype).view(*output_shape)
+    nvtx.range_pop()
+
+    nvtx.range_pop()  # flashinfer_fp8_linear
+    return result
 
 
 def flashinfer_deepgemm_w8a8_block_fp8_linear_with_fallback(

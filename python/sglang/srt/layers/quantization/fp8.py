@@ -669,8 +669,11 @@ class Fp8LinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        import torch.cuda.nvtx as nvtx
+
         if self.use_marlin:
-            return apply_fp8_marlin_linear(
+            nvtx.range_push("fp8_apply:marlin")
+            result = apply_fp8_marlin_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -679,27 +682,34 @@ class Fp8LinearMethod(LinearMethodBase):
                 size_k=layer.input_size_per_partition,
                 bias=bias,
             )
+            nvtx.range_pop()
+            return result
 
         if self.use_mxfp8:
+            nvtx.range_push("fp8_apply:mxfp8")
             if isinstance(x, tuple):
-                return self.w8a8_mxfp8_linear(
+                result = self.w8a8_mxfp8_linear(
                     input=x[0],
                     weight=layer.weight,
                     weight_scale=layer.weight_scale_inv,
                     input_scale=x[1],
                     bias=bias,
                 )
-            return self.w8a8_mxfp8_linear(
-                input=x,
-                weight=layer.weight,
-                weight_scale=layer.weight_scale_inv,
-                input_scale=None,
-                bias=bias,
-            )
+            else:
+                result = self.w8a8_mxfp8_linear(
+                    input=x,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale_inv,
+                    input_scale=None,
+                    bias=bias,
+                )
+            nvtx.range_pop()
+            return result
 
         if self.block_quant:
             if use_intel_amx_backend(layer):
-                return torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
+                nvtx.range_push("fp8_apply:amx")
+                result = torch.ops.sgl_kernel.fp8_scaled_mm_cpu(
                     x,
                     layer.weight,
                     layer.weight_scale_inv,
@@ -708,9 +718,12 @@ class Fp8LinearMethod(LinearMethodBase):
                     x.dtype,
                     True,  # is_vnni
                 )
+                nvtx.range_pop()
+                return result
 
             if isinstance(x, tuple):
-                return self.w8a8_block_fp8_linear(
+                nvtx.range_push("fp8_apply:block_quant_tuple")
+                result = self.w8a8_block_fp8_linear(
                     input=x[0],
                     weight=layer.weight,
                     block_size=self.quant_config.weight_block_size,
@@ -718,8 +731,11 @@ class Fp8LinearMethod(LinearMethodBase):
                     input_scale=x[1],
                     bias=bias,
                 )
+                nvtx.range_pop()
+                return result
 
-            return self.w8a8_block_fp8_linear(
+            nvtx.range_push("fp8_apply:block_quant")
+            result = self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
                 block_size=self.quant_config.weight_block_size,
@@ -727,8 +743,11 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_scale=None,
                 bias=bias,
             )
+            nvtx.range_pop()
+            return result
 
-        return apply_fp8_linear(
+        nvtx.range_push("fp8_apply:dynamic")
+        result = apply_fp8_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,
@@ -737,6 +756,8 @@ class Fp8LinearMethod(LinearMethodBase):
             cutlass_fp8_supported=self.cutlass_fp8_supported,
             use_per_token_if_dynamic=self.use_per_token_if_dynamic,
         )
+        nvtx.range_pop()
+        return result
 
 
 class Fp8MoEMethod(FusedMoEMethodBase):

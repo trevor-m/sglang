@@ -658,6 +658,8 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    import torch.cuda.nvtx as nvtx
+
     assert input_scale is None
 
     output_dtype = input.dtype
@@ -667,6 +669,7 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
     if not (shape_supported and dtype_supported):
+        nvtx.range_push("deepgemm_fallback_triton")
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
         # UE8M0 format has shape (N, K//block_k//4) with dtype int32
@@ -675,13 +678,20 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             weight_scale = _unpack_ue8m0_scale_for_triton(
                 weight_scale, weight.shape, block_size
             )
-        return triton_w8a8_block_fp8_linear(
+        result = triton_w8a8_block_fp8_linear(
             input, weight, block_size, weight_scale, input_scale, bias
         )
+        nvtx.range_pop()
+        return result
 
+    nvtx.range_push("deepgemm_main_path")
+
+    nvtx.range_push("input_view")
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+    nvtx.range_pop()
 
+    nvtx.range_push("quant")
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d,
         block_size[1],
@@ -689,13 +699,23 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         scale_tma_aligned=True,
         scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
     )
+    nvtx.range_pop()
 
+    nvtx.range_push("deepgemm_matmul")
     output = w8a8_block_fp8_matmul_deepgemm(
         q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
     )
+    nvtx.range_pop()
+
     if bias is not None:
         output += bias
-    return output.to(dtype=output_dtype).view(*output_shape)
+
+    nvtx.range_push("output_cast")
+    result = output.to(dtype=output_dtype).view(*output_shape)
+    nvtx.range_pop()
+
+    nvtx.range_pop()  # deepgemm_main_path
+    return result
 
 
 def _unpack_ue8m0_scale_for_triton(

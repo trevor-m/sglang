@@ -639,24 +639,55 @@ class MiniMaxM2Attention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
+        import torch.cuda.nvtx as nvtx
+
+        nvtx.range_push("attn::forward_prepare")
+
+        nvtx.range_push("qkv_proj")
         qkv, _ = self.qkv_proj(hidden_states)
+        nvtx.range_pop()
+
+        nvtx.range_push("qkv_split")
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        nvtx.range_pop()
+
         if self.use_qk_norm:
-            # q = self.q_norm(q.contiguous())
-            # k = self.k_norm(k.contiguous())
-            q, k = MiniMaxM2RMSNormTP.forward_qk(
-                self.q_norm, self.k_norm, q.contiguous(), k.contiguous()
-            )
+            nvtx.range_push("qk_contiguous")
+            q_c, k_c = q.contiguous(), k.contiguous()
+            nvtx.range_pop()
+
+            nvtx.range_push("qk_norm")
+            q, k = MiniMaxM2RMSNormTP.forward_qk(self.q_norm, self.k_norm, q_c, k_c)
+            nvtx.range_pop()
         else:
+            nvtx.range_push("qk_contiguous")
             q, k = q.contiguous(), k.contiguous()
+            nvtx.range_pop()
+
+        nvtx.range_push("rotary_emb")
         q, k = self.rotary_emb(positions, q, k)
+        nvtx.range_pop()
+
         inner_state = q, k, v, forward_batch
+        nvtx.range_pop()  # attn::forward_prepare
         return None, forward_batch, inner_state
 
     def forward_core(self, intermediate_state):
+        import torch.cuda.nvtx as nvtx
+
+        nvtx.range_push("attn::forward_core")
+
         _, _, inner_state = intermediate_state
+
+        nvtx.range_push("attn_forward")
         attn_output = self.attn(*inner_state)
+        nvtx.range_pop()
+
+        nvtx.range_push("o_proj")
         output, _ = self.o_proj(attn_output)
+        nvtx.range_pop()
+
+        nvtx.range_pop()  # attn::forward_core
         return output
 
     def forward(
@@ -747,29 +778,43 @@ class MiniMaxM2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         residual: Optional[torch.Tensor],
     ) -> torch.Tensor:
+        import torch.cuda.nvtx as nvtx
+
+        nvtx.range_push(f"layer_{self.layer_id}")
+
         # Self Attention
+        nvtx.range_push("prepare_attn")
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states, residual, forward_batch
         )
+        nvtx.range_pop()
 
+        nvtx.range_push("self_attn")
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
+        nvtx.range_pop()
 
         # Fully Connected (MLP or MoE)
-
+        nvtx.range_push("prepare_mlp")
         hidden_states, residual = self.layer_communicator.prepare_mlp(
             hidden_states, residual, forward_batch
         )
+        nvtx.range_pop()
 
+        nvtx.range_push("block_sparse_moe")
         hidden_states = self.block_sparse_moe(hidden_states, forward_batch)
+        nvtx.range_pop()
 
+        nvtx.range_push("postprocess_layer")
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
+        nvtx.range_pop()
 
+        nvtx.range_pop()  # layer_{id}
         return hidden_states, residual
 
     # TBO Operations for MiniMax Decoder Layer

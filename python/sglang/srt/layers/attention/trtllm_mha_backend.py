@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
+import torch.cuda.nvtx as nvtx
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.flashinfer_backend import (
@@ -483,6 +484,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             metadata.cu_seqlens_k[1:].copy_(
                 torch.cumsum(metadata.cache_seqlens_int32, dim=0, dtype=torch.int32)
             )
+            nvtx.range_push("replay_page_table_decode")
             page_indices = self.req_to_token[
                 req_pool_indices[:, None],
                 self.decode_cuda_graph_metadata["strided_indices"][:max_seq_pages][
@@ -491,6 +493,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             ]
             metadata.page_table[:, :max_seq_pages].copy_(page_indices // self.page_size)
             self._copy_swa_page_table(metadata, page_indices, max_seq_pages)
+            nvtx.range_pop()
         elif forward_mode.is_target_verify():
             # Here we only support topk = 1 for now.
             metadata = self.target_verify_metadata[bs]
@@ -675,10 +678,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cu_seqlens_q = metadata.cu_seqlens_k
 
         # Compute SWA page table (None for non-SWA models)
+        nvtx.range_push("maybe_translate_swa")
         metadata.swa_page_table = self._maybe_translate_swa(metadata.page_table)
+        nvtx.range_pop()
 
         # Convert the page tables to a strided format
         if self.page_size > 1:
+            nvtx.range_push("page_table_striding")
             self.strided_indices = torch.arange(
                 0, metadata.page_table.shape[1], self.page_size, device=self.device
             )
@@ -689,6 +695,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.swa_page_table = (
                     metadata.swa_page_table[:, self.strided_indices] // self.page_size
                 )
+            nvtx.range_pop()
 
         self.forward_metadata = metadata
 
@@ -703,12 +710,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
+        nvtx.range_push("trtllm_mha::forward_decode")
         cache_loc = forward_batch.out_cache_loc
 
         use_fused_fp8_path = self._should_use_fused_fp8_path(save_kv_cache, k)
 
         if use_fused_fp8_path:
-            # Use fused FP8 quantization + KV cache write path
+            nvtx.range_push("fused_fp8_set_kv_buffer")
             self._fused_fp8_set_kv_buffer(
                 q=q,
                 k=k,
@@ -716,37 +724,45 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 layer=layer,
                 forward_batch=forward_batch,
             )
+            nvtx.range_pop()
             k = None
             v = None
         else:
-            # Use original set_kv_buffer path
             if save_kv_cache and k is not None:
+                nvtx.range_push("set_kv_buffer")
                 forward_batch.token_to_kv_pool.set_kv_buffer(
                     layer, cache_loc, k, v, layer.k_scale, layer.v_scale
                 )
+                nvtx.range_pop()
 
-        # For XQA, q_dtype should be bf16
+        nvtx.range_push("q_contiguous_view")
         if self.data_type == torch.float8_e4m3fn and (not self.is_xqa_impl):
             q = q.to(torch.float8_e4m3fn)
         q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        nvtx.range_pop()
+
+        nvtx.range_push("get_kv_buffer")
         k_cache, v_cache = forward_batch.token_to_kv_pool.get_kv_buffer(layer.layer_id)
-        # shape conversion:
-        # [num_pages, page_size, num_kv_heads, head_dim] -> [num_pages, num_kv_heads, page_size, head_dim]
+        nvtx.range_pop()
+
+        nvtx.range_push("kv_cache_permute")
         k_cache = k_cache.view(
             -1, self.page_size, layer.tp_k_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
         v_cache = v_cache.view(
             -1, self.page_size, layer.tp_v_head_num, layer.head_dim
         ).permute(0, 2, 1, 3)
+        nvtx.range_pop()
 
+        nvtx.range_push("canonicalize_stride")
         if layer.tp_k_head_num == 1:
             k_cache = canonicalize_stride(k_cache)
         if layer.tp_v_head_num == 1:
             v_cache = canonicalize_stride(v_cache)
+        nvtx.range_pop()
 
         kv_cache = (k_cache, v_cache)
 
-        # TODO: add support for quantization
         q_scale = 1.0
         k_scale = (
             layer.k_scale_float
@@ -755,13 +771,13 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         )
         bmm1_scale = q_scale * k_scale * layer.scaling
         bmm2_scale = 1.0
-        # sink: additional value per head in the denominator of the softmax.
         attention_sink = kwargs.get("sinks", None)
 
+        nvtx.range_push("get_layer_page_table")
         page_table = self._get_layer_page_table(layer, forward_batch)
+        nvtx.range_pop()
 
-        # Call TRT-LLM kernel
-        # raw_out: like q, [bs, acc_q_len, num_q_heads, head_dim] but with output dtype
+        nvtx.range_push("trtllm_batch_decode")
         o = flashinfer.decode.trtllm_batch_decode_with_kv_cache(
             query=q,
             kv_cache=kv_cache,
@@ -776,8 +792,14 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
             out_dtype=self.q_data_type,  # model_runner.dtype
         )
+        nvtx.range_pop()
 
-        return o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        nvtx.range_push("output_view")
+        result = o.view(-1, layer.tp_q_head_num * layer.head_dim)
+        nvtx.range_pop()
+
+        nvtx.range_pop()  # trtllm_mha::forward_decode
+        return result
 
     def forward_extend(
         self,

@@ -253,11 +253,21 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_local_tokens: int) -> Non
 
     server_args = get_global_server_args()
     use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
-    max_num_tokens = (
-        sum(get_dp_global_num_tokens())
-        if get_dp_global_num_tokens() is not None
-        else num_local_tokens * get_attention_dp_size()
+
+    # For the a2a path, the MoE layer receives post-dispatch tokens bounded
+    # by the dispatcher's workspace (SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK
+    # * ep_size).  For the standard allgather path, it receives all DP tokens.
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
+        FlashinferDispatcher,
     )
+
+    dispatcher = getattr(layer, "dispatcher", None)
+    if isinstance(dispatcher, FlashinferDispatcher):
+        max_num_tokens = dispatcher.max_num_tokens
+    elif get_dp_global_num_tokens() is not None:
+        max_num_tokens = sum(get_dp_global_num_tokens())
+    else:
+        max_num_tokens = num_local_tokens * get_attention_dp_size()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside

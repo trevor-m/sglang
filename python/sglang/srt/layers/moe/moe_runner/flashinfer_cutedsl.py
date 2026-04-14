@@ -268,6 +268,9 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_local_tokens: int) -> Non
         max_num_tokens = sum(get_dp_global_num_tokens())
     else:
         max_num_tokens = num_local_tokens * get_attention_dp_size()
+    print(
+        f"{num_local_tokens=} {max_num_tokens=} {get_dp_global_num_tokens()=} {dispatcher.max_num_tokens=}"
+    )
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
@@ -419,6 +422,42 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         # cutedsl expects (non-interleaved), so this needs validation
         # before enabling.
         x_fp4 = hidden_states
+
+    # DEBUG: print shapes on first call to diagnose IMA
+    if not getattr(
+        fused_experts_flashinfer_to_flashinfer_cutedsl_fp4, "_logged", False
+    ):
+        fused_experts_flashinfer_to_flashinfer_cutedsl_fp4._logged = True
+        wrapper = quant_info.wrapper
+        print(
+            f"[CuteDSL a2a DEBUG] wrapper: num_experts={wrapper.num_experts} "
+            f"num_local_experts={wrapper.num_local_experts} "
+            f"local_expert_offset={wrapper.local_expert_offset} "
+            f"hidden_size={wrapper.hidden_size} "
+            f"intermediate_size={wrapper.intermediate_size} "
+            f"max_num_tokens={wrapper.max_num_tokens} "
+            f"tile_size={wrapper.tile_size}",
+            flush=True,
+        )
+        print(
+            f"[CuteDSL a2a DEBUG] x_fp4={x_fp4.shape} {x_fp4.dtype} | "
+            f"x_sf={x_sf.shape} {x_sf.dtype} | "
+            f"topk_ids={topk_ids.shape} {topk_ids.dtype} "
+            f"min={topk_ids.min().item()} max={topk_ids.max().item()} | "
+            f"topk_weights={topk_weights.shape} {topk_weights.dtype}",
+            flush=True,
+        )
+        print(
+            f"[CuteDSL a2a DEBUG] w13_weight={quant_info.w13_weight.shape} | "
+            f"w2_weight={quant_info.w2_weight.shape} | "
+            f"w13_weight_sf={quant_info.w13_weight_sf.shape} | "
+            f"w2_weight_sf={quant_info.w2_weight_sf.shape} | "
+            f"w1_alpha={quant_info.w1_alpha.shape} | "
+            f"w2_alpha={quant_info.w2_alpha.shape} | "
+            f"fc2_input_scale={quant_info.fc2_input_scale.shape} | "
+            f"input_scale={quant_info.input_scale.shape}",
+            flush=True,
+        )
 
     output = quant_info.wrapper.run(
         x=x_fp4,

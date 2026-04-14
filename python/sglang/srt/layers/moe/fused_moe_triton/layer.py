@@ -1017,6 +1017,14 @@ class FusedMoE(torch.nn.Module):
             dispatch_output=dispatch_output,
         )
 
+        # On the first forward (autotune warmup), sync all ranks before
+        # combine() so that lazy init in run_moe_core (e.g. CuteDslMoEWrapper
+        # creation, DeepGEMM JIT) on slow ranks doesn't cause combine timeouts.
+        if not getattr(self, "_warmup_barrier_done", False):
+            torch.cuda.synchronize()
+            get_tp_group().barrier()
+            self._warmup_barrier_done = True
+
         with use_symmetric_memory(
             get_tp_group(), disabled=not is_allocation_symmetric()
         ):

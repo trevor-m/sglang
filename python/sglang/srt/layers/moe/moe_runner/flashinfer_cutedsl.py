@@ -6,6 +6,10 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.layers.dp_attention import (
+    get_attention_dp_size,
+    get_dp_global_num_tokens,
+)
 from sglang.srt.layers.moe.moe_runner.base import (
     MoeQuantInfo,
     MoeRunnerConfig,
@@ -218,7 +222,7 @@ def resolve_cutedsl_standard_scales(
     return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
-def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
+def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_local_tokens: int) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
@@ -249,16 +253,11 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
 
     server_args = get_global_server_args()
     use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
-    max_num_tokens = max(
-        getattr(server_args, "cuda_graph_max_bs", None) or 512,
-        getattr(server_args, "chunked_prefill_size", None) or 8192,
+    max_num_tokens = (
+        sum(get_dp_global_num_tokens())
+        if get_dp_global_num_tokens() is not None
+        else num_local_tokens * get_attention_dp_size()
     )
-    # In DP attention + EP mode, MoE receives tokens from all DP ranks:
-    # - Standard path (allgather): dp_size * local_tokens
-    # - A2A path (dispatch): ep_size * runtime_max_per_rank
-    dp_size = getattr(server_args, "dp_size", 1) or 1
-    if dp_size > 1:
-        max_num_tokens *= dp_size
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside

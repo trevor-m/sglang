@@ -1882,6 +1882,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
                 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
                     _FP4_SF_VEC_SIZE,
+                    resolve_cutedsl_standard_scales,
                 )
 
                 sf_vec_size = _FP4_SF_VEC_SIZE
@@ -1914,6 +1915,13 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                     ),
                     requires_grad=False,
                 )
+
+                # Resolve CuteDSL GEMM scales eagerly (all inputs are ready).
+                w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+                    resolve_cutedsl_standard_scales(layer)
+                )
+                layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
+                layer._cutedsl_input_scale = used_input_scale
 
             # Both flashinfer cutlass and regular cutlass use same processing for w2
 
@@ -2014,10 +2022,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         if self.enable_flashinfer_cutedsl_moe:
             from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
                 CuteDslFp4MoeQuantInfo,
-                ensure_cutedsl_wrapper,
             )
 
-            ensure_cutedsl_wrapper(layer, dispatch_output.hidden_states.shape[0])
             w1_alpha, fc2_input_scale, w2_alpha = layer._cutedsl_scales
             w1_weight_sf = getattr(
                 layer, "w13_blockscale_mma", layer.w13_blockscale_swizzled
@@ -2025,8 +2031,12 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             w2_weight_sf = getattr(
                 layer, "w2_blockscale_mma", layer.w2_blockscale_swizzled
             )
+            top_k = (
+                layer.top_k
+                if layer.top_k is not None
+                else layer.moe_runner_config.top_k
+            )
             quant_info = CuteDslFp4MoeQuantInfo(
-                wrapper=layer._cutedsl_wrapper,
                 w13_weight=layer.w13_weight,
                 w2_weight=layer.w2_weight,
                 w13_weight_sf=w1_weight_sf,
@@ -2035,6 +2045,11 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 w2_alpha=w2_alpha,
                 fc2_input_scale=fc2_input_scale,
                 input_scale=layer._cutedsl_input_scale,
+                num_experts=layer.num_experts,
+                top_k=top_k,
+                num_local_experts=layer.num_local_experts,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                output_dtype=layer.moe_runner_config.params_dtype,
             )
             return self.runner.run(dispatch_output, quant_info)
 

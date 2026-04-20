@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -31,7 +31,7 @@ _cutedsl_logged_scalarize: set = set()
 
 # ---------------------------------------------------------------------------
 # Weight / scale preparation utilities (called from modelopt_quant.py during
-# process_weights_after_loading and lazy wrapper init)
+# process_weights_after_loading)
 # ---------------------------------------------------------------------------
 
 
@@ -218,85 +218,6 @@ def resolve_cutedsl_standard_scales(
     return w1_alpha, fc2_input_scale, w2_alpha, used_input_scale
 
 
-def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_tokens: int = 0) -> None:
-    """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
-
-    Args:
-        layer: The FusedMoE layer module.
-        num_tokens: Current token count entering the MoE layer.  Used as
-            the buffer size for the non-a2a (allgather) path, where the
-            autotune dummy run passes req_to_token_pool.size * dp_size —
-            the worst-case post-allgather batch.  For the a2a path this
-            is ignored in favour of the dispatcher's workspace limit.
-
-    The wrapper is created lazily (not in __init__ / create_weights) because
-    it depends on final weight shapes and EP configuration.  The wrapper's
-    CUDA-graph buffers are allocated inside CuteDslMoEWrapper.__init__, which
-    typically runs during the autotune dummy forward under inference_mode().
-    We wrap the creation in inference_mode(False) so that those pre-allocated
-    buffers are normal tensors -- inference tensors cannot be inplace-updated
-    during later CUDA graph capture, which runs outside inference_mode.
-    """
-    if getattr(layer, "_cutedsl_wrapper", None) is not None:
-        return
-
-    try:
-        from flashinfer import CuteDslMoEWrapper
-    except ImportError as e:
-        raise ImportError(
-            "flashinfer_cutedsl backend requires FlashInfer with CuteDSL support. "
-            "Install with: pip install flashinfer"
-        ) from e
-
-    from sglang.srt.server_args import get_global_server_args
-
-    assert layer.intermediate_size_per_partition > 0, (
-        f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
-        f"got {layer.intermediate_size_per_partition}. Check EP/TP configuration."
-    )
-
-    server_args = get_global_server_args()
-    use_cuda_graph = server_args is not None and not server_args.disable_cuda_graph
-
-    # Buffer size must cover the worst-case token count the MoE layer can see.
-    # - A2A path: bounded by the dispatcher's workspace allocation.
-    # - Standard allgather path: dp_size * max local tokens per rank.
-    dispatcher = getattr(layer, "dispatcher", None)
-    if hasattr(dispatcher, "max_num_tokens"):
-        # A2A path: bounded by the dispatcher's workspace allocation.
-        max_num_tokens = dispatcher.max_num_tokens
-    else:
-        # Standard allgather path: num_tokens from the first forward is
-        # req_to_token_pool.size * dp_size (the autotune dummy run's batch),
-        # which is the worst-case post-allgather token count.
-        max_num_tokens = max(num_tokens, 1)
-    top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
-    # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
-    # buffers are normal tensors.  This call typically happens inside
-    # _dummy_run which runs under inference_mode(); inference tensors cannot
-    # be inplace-updated during later CUDA graph capture (which runs outside
-    # inference_mode), so we must opt out here.
-    with torch.inference_mode(False):
-        layer._cutedsl_wrapper = CuteDslMoEWrapper(
-            num_experts=layer.num_experts,
-            top_k=top_k,
-            hidden_size=layer.hidden_size,
-            intermediate_size=layer.intermediate_size_per_partition,
-            use_cuda_graph=use_cuda_graph,
-            max_num_tokens=max_num_tokens,
-            num_local_experts=layer.num_local_experts,
-            local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
-            output_dtype=layer.moe_runner_config.params_dtype,
-            device=str(layer.w13_weight.device),
-        )
-
-    w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-        resolve_cutedsl_standard_scales(layer)
-    )
-    layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
-    layer._cutedsl_input_scale = used_input_scale
-
-
 # ---------------------------------------------------------------------------
 # Dataclass + fused function for moe_runner dispatch
 # ---------------------------------------------------------------------------
@@ -305,9 +226,6 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module, num_tokens: int = 0) -> None:
 @dataclass
 class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     """Quantization payload consumed by FlashInfer CuteDSL FP4 MoE kernels."""
-
-    # Lazily-created CuteDslMoEWrapper (stashed on layer)
-    wrapper: Any
 
     # Weights (uint8 FP4 packed)
     w13_weight: torch.Tensor
@@ -327,6 +245,13 @@ class CuteDslFp4MoeQuantInfo(MoeQuantInfo):
     # Activation quantization scale (scalarized)
     input_scale: torch.Tensor
 
+    # MoE topology (passed to cute_dsl_fused_moe_nvfp4)
+    num_experts: int = 0
+    top_k: int = 0
+    num_local_experts: int = 0
+    local_expert_offset: int = 0
+    output_dtype: torch.dtype = torch.bfloat16
+
 
 @register_fused_func("none", "flashinfer_cutedsl")
 def fused_experts_none_to_flashinfer_cutedsl_fp4(
@@ -334,7 +259,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
     quant_info: CuteDslFp4MoeQuantInfo,
     runner_config: MoeRunnerConfig,
 ) -> StandardCombineInput:
-    from flashinfer import fp4_quantize
+    from flashinfer import cute_dsl_fused_moe_nvfp4, fp4_quantize
 
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
@@ -357,7 +282,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         is_sf_swizzled_layout=False,
     )
 
-    output = quant_info.wrapper.run(
+    output = cute_dsl_fused_moe_nvfp4(
         x=x_fp4,
         x_sf=x_sf,
         token_selected_experts=topk_ids,
@@ -369,6 +294,11 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
+        num_experts=quant_info.num_experts,
+        top_k=quant_info.top_k,
+        num_local_experts=quant_info.num_local_experts,
+        local_expert_offset=quant_info.local_expert_offset,
+        output_dtype=quant_info.output_dtype,
     )
 
     return StandardCombineInput(hidden_states=output)
@@ -386,7 +316,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     - bf16 input (SGLANG_MOE_NVFP4_DISPATCH=0): quantize with cutedsl's scale
     - FP4 input (SGLANG_MOE_NVFP4_DISPATCH=1): pass through (same fp4_quantize params)
     """
-    from flashinfer import fp4_quantize
+    from flashinfer import cute_dsl_fused_moe_nvfp4, fp4_quantize
 
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
@@ -416,7 +346,7 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
             is_sf_swizzled_layout=False,
         )
 
-    output = quant_info.wrapper.run(
+    output = cute_dsl_fused_moe_nvfp4(
         x=x_fp4,
         x_sf=x_sf,
         token_selected_experts=topk_ids,
@@ -428,13 +358,12 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
         w2_weight=quant_info.w2_weight,
         w2_weight_sf=quant_info.w2_weight_sf,
         w2_alpha=quant_info.w2_alpha,
+        num_experts=quant_info.num_experts,
+        top_k=quant_info.top_k,
+        num_local_experts=quant_info.num_local_experts,
+        local_expert_offset=quant_info.local_expert_offset,
+        output_dtype=quant_info.output_dtype,
+        moe_output=dispatch_output.moe_output,
     )
-
-    # Note: output contains routed expert results; shared_expert is handled separately
-
-    # Write into pre-allocated workspace buffer if available
-    if dispatch_output.moe_output is not None:
-        dispatch_output.moe_output.copy_(output)
-        output = dispatch_output.moe_output
 
     return FlashinferCombineInput(hidden_states=output)

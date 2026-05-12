@@ -128,6 +128,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
+    ResetSpecAcceptLengthReqInput,
+    ResetSpecAcceptLengthReqOutput,
     ResumeMemoryOccupationReqInput,
     RpcReqInput,
     RpcReqOutput,
@@ -1416,6 +1418,7 @@ class Scheduler(
                 (BatchTokenizedGenerateReqInput, self.handle_batch_generate_request),
                 (BatchTokenizedEmbeddingReqInput, self.handle_batch_embedding_request),
                 (FlushCacheReqInput, self.flush_cache_wrapped),
+                (ResetSpecAcceptLengthReqInput, self.reset_spec_accept_length),
                 (ClearHiCacheReqInput, self.clear_hicache_storage_wrapped),
                 (AttachHiCacheStorageReqInput, self.attach_hicache_storage_wrapped),
                 (DetachHiCacheStorageReqInput, self.detach_hicache_storage_wrapped),
@@ -3426,6 +3429,24 @@ class Scheduler(
             )
             success = False
         return success
+
+    def reset_spec_accept_length(
+        self, recv_req: ResetSpecAcceptLengthReqInput
+    ) -> ResetSpecAcceptLengthReqOutput:
+        """Reset the lifetime accumulators behind avg_spec_accept_length."""
+        if self.spec_algorithm.is_none():
+            return ResetSpecAcceptLengthReqOutput(
+                success=False,
+                message="Speculative decoding is not enabled.",
+            )
+        if self.spec_total_num_forward_ct > 0:
+            prev_avg = (
+                self.spec_total_num_accepted_tokens / self.spec_total_num_forward_ct
+            )
+            logger.info(f"Resetting avg_spec_accept_length (previous: {prev_avg:.4f})")
+        self.spec_total_num_accepted_tokens = 0
+        self.spec_total_num_forward_ct = 0
+        return ResetSpecAcceptLengthReqOutput(success=True)
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         ret = dict(vars(get_global_server_args()))  # vars returns a ref to obj.__dict__

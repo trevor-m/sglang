@@ -777,6 +777,21 @@ async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     )
 
 
+@app.api_route("/reset_spec_accept_length", methods=["GET", "POST"])
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def reset_spec_accept_length():
+    """Reset the lifetime accumulators behind avg_spec_accept_length."""
+    ret = await _global_state.tokenizer_manager.reset_spec_accept_length()
+    if ret.success:
+        content = "avg_spec_accept_length reset.\n"
+    else:
+        content = ret.message or "Reset failed.\n"
+    return Response(
+        content=content,
+        status_code=200 if ret.success else HTTPStatus.BAD_REQUEST,
+    )
+
+
 @app.post("/add_external_corpus")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def add_external_corpus(request: Request):

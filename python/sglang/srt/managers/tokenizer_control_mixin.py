@@ -62,6 +62,8 @@ from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
+    ResetSpecAcceptLengthReqInput,
+    ResetSpecAcceptLengthReqOutput,
     ResumeMemoryOccupationReqInput,
     ResumeMemoryOccupationReqOutput,
     SendWeightsToRemoteInstanceReqInput,
@@ -108,6 +110,7 @@ _COMMUNICATOR_SPECS = [
     ("check_weights", CheckWeightsReqOutput),
     ("slow_down", SlowDownReqOutput),
     ("flush_cache", FlushCacheReqOutput),
+    ("reset_spec_accept_length", ResetSpecAcceptLengthReqOutput),
     ("add_external_corpus", AddExternalCorpusReqOutput),
     ("remove_external_corpus", RemoveExternalCorpusReqOutput),
     ("list_external_corpora", ListExternalCorporaReqOutput),
@@ -259,6 +262,16 @@ class TokenizerControlMixin:
         return (
             await self.flush_cache_communicator(FlushCacheReqInput(timeout_s=timeout_s))
         )[0]
+
+    async def reset_spec_accept_length(
+        self: TokenizerManager,
+    ) -> ResetSpecAcceptLengthReqOutput:
+        self.auto_create_handle_loop()
+        results = await self.reset_spec_accept_length_communicator(
+            ResetSpecAcceptLengthReqInput()
+        )
+        all_success, all_message = FanOutCommunicator.merge_results(results)
+        return ResetSpecAcceptLengthReqOutput(success=all_success, message=all_message)
 
     async def clear_hicache_storage(self: TokenizerManager) -> ClearHiCacheReqOutput:
         """Clear the hierarchical cache storage."""

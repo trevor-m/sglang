@@ -1257,6 +1257,17 @@ class FlushCacheReqOutput(BaseReq):
 
 
 @dataclass
+class ResetSpecAcceptLengthReqInput(BaseReq):
+    pass
+
+
+@dataclass
+class ResetSpecAcceptLengthReqOutput(BaseReq):
+    success: bool
+    message: str = ""
+
+
+@dataclass
 class AddExternalCorpusReqInput(BaseReq):
     corpus_id: Optional[str] = None
     file_path: Optional[str] = None

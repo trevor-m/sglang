@@ -254,16 +254,26 @@ def _resolve_tokenizers_backend(tokenizer_name, *args, **common_kwargs):
 
 
 def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
-    """Fix pre_tokenizer/decoder when a v5 tokenizer class overwrites them.
+    """Fix the backend tokenizer when a v5 tokenizer class rebuilds it from scratch.
 
-    In transformers v5, some tokenizer classes (e.g. LlamaTokenizer) have a
-    custom __init__ that rebuilds the pre_tokenizer and decoder from scratch
-    with class-specific components, discarding the originals from tokenizer.json.
-    This breaks models that specify LlamaTokenizerFast but actually use a
-    different tokenizer architecture (e.g. DeepSeek-V3.2 uses ByteLevel).
+    In transformers v5, AutoTokenizer.from_pretrained now prefers the specialized
+    tokenizer class (e.g. LlamaTokenizer) over TokenizersBackend when the model's
+    tokenizer_config.json names one. LlamaTokenizer.__init__ then constructs
+    ``self._tokenizer = Tokenizer(BPE(vocab, merges, fuse_unk=True,
+    byte_fallback=True, dropout=None))`` and hardcodes a Metaspace pre_tokenizer
+    plus a Replace/ByteFallback/Fuse decoder. For models whose tokenizer.json is
+    not actually a Llama-style SentencePiece BPE (e.g. DeepSeek-R1/V3 use a
+    ByteLevel BPE), the rebuilt backend tokenizes incorrectly — fragmenting
+    text to ~character level and inflating prompt token counts ~4x, which
+    cascades into KV-cache bloat and throughput collapse.
 
-    Detects the mismatch by comparing against the raw tokenizer.json and
-    restores the original components when they differ.
+    Reassigning only ``backend.pre_tokenizer`` / ``backend.decoder`` is not
+    enough: the BPE model itself was instantiated with hardcoded flags
+    (``fuse_unk``, ``byte_fallback``, ``dropout``) and the normalizer/
+    post_processor from tokenizer.json were dropped. Replace the entire
+    backend with the one loaded directly from tokenizer.json so that all
+    components — model, normalizer, pre_tokenizer, post_processor, decoder,
+    added_tokens — match the on-disk serialization.
     """
     backend = getattr(tokenizer, "_tokenizer", None)
     if backend is None:
@@ -292,16 +302,15 @@ def _fix_v5_tokenizer_components(tokenizer, model_name_or_path, revision=None):
 
     if raw_pre and loaded_pre and raw_pre != loaded_pre:
         logger.info(
-            "Fixing v5 tokenizer component mismatch for %s: "
-            "pre_tokenizer %s -> %s, decoder %s -> %s",
+            "Fixing v5 tokenizer for %s: replacing rebuilt backend tokenizer with "
+            "tokenizer.json (pre_tokenizer %s -> %s, decoder %s -> %s)",
             model_name_or_path,
             loaded_pre,
             raw_pre,
             type(backend.decoder).__name__ if backend.decoder else None,
             type(raw.decoder).__name__ if raw.decoder else None,
         )
-        backend.pre_tokenizer = raw.pre_tokenizer
-        backend.decoder = raw.decoder
+        tokenizer._tokenizer = raw
 
 
 def _fix_v5_add_bos_eos_token(tokenizer, model_name_or_path, revision=None):

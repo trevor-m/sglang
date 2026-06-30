@@ -292,7 +292,7 @@ if is_blackwell_supported() and is_flashinfer_available():
     @register_custom_op(
         op_name="flashinfer_gemm_fp8_nt_groupwise",
         mutates_args=[],
-        fake_impl=lambda q_input, weight, x_scale, weight_scale, out_dtype: (
+        fake_impl=lambda q_input, weight, x_scale, weight_scale, out_dtype, mma_sm=1: (
             q_input.new_empty((q_input.shape[0], weight.shape[0]), dtype=out_dtype)
         ),
     )
@@ -302,6 +302,7 @@ if is_blackwell_supported() and is_flashinfer_available():
         x_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         out_dtype: torch.dtype,
+        mma_sm: int = 1,
     ) -> torch.Tensor:
         backend = _get_flashinfer_groupwise_backend()
         if backend == "cutlass":
@@ -324,6 +325,7 @@ if is_blackwell_supported() and is_flashinfer_available():
             weight_scale,
             out_dtype=out_dtype,
             backend=backend,
+            mma_sm=mma_sm,
         )
 
     # Wrap MXFP8 ops as custom ops so torch.compile does not trace into
@@ -591,12 +593,15 @@ def flashinfer_gemm_w8a8_block_fp8_linear_with_fallback(
             f"got {weight_scale.dtype}."
         )
     # TRTLLM path continues using the original quantized scale layout.
+    # mma_sm=2 is faster for large M (>=256).
+    mma_sm = 2 if input_2d.shape[0] >= 256 else 1
     output = gemm_fp8_nt_groupwise(
         q_input,
         weight,
         x_scale,
         weight_scale,
         out_dtype=input_2d.dtype,
+        mma_sm=mma_sm,
     )
 
     if bias is not None:

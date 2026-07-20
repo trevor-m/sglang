@@ -212,6 +212,34 @@ def _is_fused_mhc_post_pre_enabled() -> bool:
     )
 
 
+# FlashInfer's mhc_pre_big_fuse only accepts these split-K counts.
+_FLASHINFER_MHC_PRE_SPLITS = (1, 2, 4, 8, 16)
+
+
+@functools.cache
+def _cuda_sm_count() -> int:
+    return torch.cuda.get_device_properties(0).multi_processor_count
+
+
+def _flashinfer_mhc_pre_num_splits(num_tokens: int, hc_hidden_size: int) -> int:
+    """Split-K count for the mHC-pre projection GEMM, clamped to the set
+    FlashInfer's ``mhc_pre_big_fuse`` accepts ({1, 2, 4, 8, 16}).
+
+    The projection is tall-skinny (K = ``hc_hidden_size``, N = 24), so split-K
+    over K governs GPU occupancy. Mirrors the TileLang heuristic
+    ``_compute_num_split_for_mhc_pre``, rounded down to an allowed value.
+    """
+    block_m = block_k = 64
+    grid_m = (num_tokens + block_m - 1) // block_m
+    num_block_k = (hc_hidden_size + block_k - 1) // block_k
+    raw = max(1, min(_cuda_sm_count() // max(grid_m, 1), num_block_k // 4))
+    best = 1
+    for split in _FLASHINFER_MHC_PRE_SPLITS:
+        if split <= raw:
+            best = split
+    return best
+
+
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 # PoC: compute the (replicated TP1) shared expert on LOCAL hidden before the dp
 # gather instead of on the gathered global buffer. Requires
@@ -1425,22 +1453,50 @@ class DeepseekV4DecoderLayer(nn.Module):
             return y, post, comb, False
 
         if envs.SGLANG_OPT_USE_FLASHINFER_MHC_PRE.get():
-            from flashinfer.mhc import mhc_pre_big_fuse_with_prenorm
+            from flashinfer.mhc import mhc_pre_big_fuse
 
-            # TODO: Could use tf32_hc_prenorm_gemm for this. + hc_pre_big_fuse (no prenorm)
-            # TODO: Or could use tf32 gemm
-            dot_mix = F.linear(x.flatten(1).float(), hc_fn)
-            post, comb, y = mhc_pre_big_fuse_with_prenorm(
+            from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
+                tf32_hc_prenorm_gemm,
+            )
+
+            # Compute the projection logits (dot_mix) and RMS square-sum (sqrsum)
+            # with the split-K TF32 tensor-core GEMM the TileLang path uses, not a
+            # naive fp32 F.linear (which dispatched a slow CUDA-core sgemm). The
+            # GEMM writes UN-reduced split-K partials [n_splits, tokens, 24] /
+            # [n_splits, tokens]; the non-prenorm mhc_pre_big_fuse consumes that
+            # layout, reducing the splits and applying the RMS prenorm internally.
+            # It pairs with the GEMM's sqrsum directly -- unlike ..._with_prenorm,
+            # which would recompute sqrsum from the residual.
+            num_tokens = x.shape[0]
+            hc_hidden_size = self.hc_mult * self.hidden_size
+            mix_dim = hc_fn.shape[0]  # hc_mult * (2 + hc_mult) == 24
+            n_splits = _flashinfer_mhc_pre_num_splits(num_tokens, hc_hidden_size)
+            dot_mix = torch.empty(
+                (n_splits, num_tokens, mix_dim), dtype=torch.float32, device=x.device
+            )
+            sqrsum = torch.empty(
+                (n_splits, num_tokens), dtype=torch.float32, device=x.device
+            )
+            tf32_hc_prenorm_gemm(
+                x.reshape(num_tokens, hc_hidden_size), hc_fn, dot_mix, sqrsum, n_splits
+            )
+            post, comb, y = mhc_pre_big_fuse(
                 dot_mix,
+                sqrsum,
                 x,
                 hc_scale,
                 hc_base,
+                hc_hidden_size,  # k: RMS denominator == hc_mult * hidden_size
                 rms_eps=self.rms_norm_eps,
                 mhc_pre_eps=self.hc_eps,
                 mhc_sinkhorn_eps=self.hc_eps,
                 mhc_post_mult_value=_MHC_POST_MULT_VALUE,
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
+                num_splits=n_splits,
             )
+            # y (layer_input) is pre-(transformer-norm); the caller applies the
+            # input/post_attention RMSNorm (norm_fused=False), mirroring the torch
+            # and AITER paths.
             return y, post.squeeze(-1), comb, False
 
         elif envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():

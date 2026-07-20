@@ -1480,6 +1480,12 @@ class DeepseekV4DecoderLayer(nn.Module):
             tf32_hc_prenorm_gemm(
                 x.reshape(num_tokens, hc_hidden_size), hc_fn, dot_mix, sqrsum, n_splits
             )
+            if n_splits == 1:
+                # The split-K GEMM always writes a leading split axis, but
+                # mhc_pre_big_fuse's num_splits=1 path wants 2D dot_mix / 1D
+                # sqrsum (no split axis). squeeze is a view; the kernel copies.
+                dot_mix = dot_mix.squeeze(0)
+                sqrsum = sqrsum.squeeze(0)
             post, comb, y = mhc_pre_big_fuse(
                 dot_mix,
                 sqrsum,

@@ -1424,7 +1424,26 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             return y, post, comb, False
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC_PRE.get():
+            from flashinfer.mhc import mhc_pre_big_fuse_with_prenorm
+
+            # TODO: Could use tf32_hc_prenorm_gemm for this. + hc_pre_big_fuse (no prenorm)
+            # TODO: Or could use tf32 gemm
+            dot_mix = F.linear(x.flatten(1).float(), hc_fn)
+            post, comb, y = mhc_pre_big_fuse_with_prenorm(
+                dot_mix,
+                x,
+                hc_scale,
+                hc_base,
+                rms_eps=self.rms_norm_eps,
+                mhc_pre_eps=self.hc_eps,
+                mhc_sinkhorn_eps=self.hc_eps,
+                mhc_post_mult_value=_MHC_POST_MULT_VALUE,
+                sinkhorn_repeat=self.hc_sinkhorn_iters,
+            )
+            return y, post.squeeze(-1), comb, False
+
+        elif envs.SGLANG_OPT_USE_TILELANG_MHC_PRE.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_pre
 
             norm_kwargs = {}
@@ -1517,7 +1536,14 @@ class DeepseekV4DecoderLayer(nn.Module):
         if _is_npu:
             return torch.ops.custom.npu_hc_post(x, residual, post, comb)
 
-        if envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        if envs.SGLANG_OPT_USE_FLASHINFER_MHC_POST.get():
+            from flashinfer.mhc import mhc_post
+
+            # post is [tokens, hc_mult] here (hc_pre squeezed the trailing 1);
+            # mhc_post accepts post_layer_mix as [..., hc] or [..., hc, 1].
+            return mhc_post(x, residual, post, comb)
+
+        elif envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
             from sglang.kernels.ops.layernorm.mhc import mhc_post
 
             return mhc_post(x, residual, post, comb)

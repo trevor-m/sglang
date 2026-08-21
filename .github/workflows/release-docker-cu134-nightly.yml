@@ -1,0 +1,132 @@
+name: Release Docker Images Nightly (CUDA 13.4 Rubin)
+
+# Nightly build of docker/Dockerfile.cu134 - the CUDA 13.4 / Rubin (sm_107)
+# variant of docker/Dockerfile. It is kept separate from the main docker
+# workflow because it is not a normal target:
+#   - CUDA 13.4 is a developer preview, installed from packages.nvidia.com
+#     onto a plain ubuntu:24.04 base (there is no nvidia/cuda:13.4.* image).
+#   - torch comes from the cu134 nightly channel; there is no stable one.
+#   - sglang-kernel / sgl-deep-ep / sgl-deep-gemm are compiled in-image
+#     against that nightly, so the build is long (~1.5h cold).
+# aarch64 only: Rubin parts here are SBSA.
+#
+# The published image requires --bf16-gemm-backend torch at runtime: the public
+# nvidia-cutlass-dsl does not know sm_107, and sglang's default `auto` backend
+# picks cutedsl on sm_10x and fails at startup with KeyError: 'sm_107a'.
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        default: "lmsysorg/sglang"
+      docker_target:
+        description: "Dockerfile stage to build and publish."
+        required: false
+        default: "runtime"
+      build_only:
+        description: "Build and validate without logging in or pushing."
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Offset from the other nightly docker builds; this one runs long.
+    - cron: "0 10 * * *"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-arm64:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: arm-docker-build-node
+    environment: ${{ (github.event_name == 'schedule' || !inputs.build_only) && 'prod' || null }}
+    # Cold builds recompile three CUDA wheels from source.
+    timeout-minutes: 360
+
+    steps:
+      - name: Delete huge unnecessary tools folder
+        run: rm -rf /opt/hostedtoolcache
+
+      - name: Cleanup workspace (remove root-owned files from prior runs)
+        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Compute image metadata
+        id: meta
+        run: |
+          set -euo pipefail
+          date_tag="$(date +%Y%m%d)"
+          commit_hash="$(git rev-parse --short=7 HEAD)"
+          image_repo="${{ inputs.image_repo || 'lmsysorg/sglang' }}"
+          echo "image_repo=${image_repo}"                                  >> "$GITHUB_OUTPUT"
+          echo "tag=nightly-cu134-${date_tag}-${commit_hash}"              >> "$GITHUB_OUTPUT"
+          echo "tag_rolling=nightly-cu134"                                 >> "$GITHUB_OUTPUT"
+
+      - name: Login to Docker Hub
+        if: github.event_name == 'schedule' || !inputs.build_only
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build image
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --builder default \
+            --progress=plain \
+            --platform linux/arm64 \
+            --target "${{ inputs.docker_target || 'runtime' }}" \
+            --build-arg BRANCH_TYPE=local \
+            --build-arg BUILD_TYPE=all \
+            --build-arg BUILD_JOBS="$(nproc)" \
+            -f docker/Dockerfile.cu134 \
+            -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" \
+            -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag_rolling }}" \
+            .
+
+      - name: Validate image
+        run: |
+          set -euo pipefail
+          # The docker build node has no GPU, so this is an import/packaging
+          # check only. GPU validation (serving a model) runs on Rubin hardware
+          # separately - see docker/cu134/README.md.
+          docker run --rm "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" \
+            python3 -c "
+          import importlib.metadata as md
+          import sglang, sgl_kernel, deep_gemm, deep_ep, flashinfer, torch
+          print('sglang           ', sglang.__version__)
+          print('torch            ', torch.__version__)
+          print('sglang-kernel    ', md.version('sglang-kernel'))
+          print('sgl-deep-gemm    ', md.version('sgl-deep-gemm'))
+          print('sgl-deep-ep      ', md.version('sgl-deep-ep'))
+          print('flashinfer-python', md.version('flashinfer-python'))
+          assert torch.version.cuda.startswith('13.4'), torch.version.cuda
+          assert '+cu134' in torch.__version__, torch.__version__
+          "
+
+      - name: Push image
+        if: github.event_name == 'schedule' || !inputs.build_only
+        run: |
+          set -euo pipefail
+          push_with_retry() {
+            for i in 1 2 3 4 5; do
+              docker push "$1" && return 0
+              echo "push failed (attempt $i), retrying in 30s"
+              sleep 30
+            done
+            return 1
+          }
+          push_with_retry "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}"
+          push_with_retry "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag_rolling }}"
+
+      - name: Cleanup local images
+        if: always()
+        run: |
+          docker rmi -f "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" || true
+          docker rmi -f "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag_rolling }}" || true

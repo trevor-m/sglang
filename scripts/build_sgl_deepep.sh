@@ -51,11 +51,23 @@ case "${CUDA_VERSION}" in
     13.0)
         CUDA_TAG=cu130
         ;;
+    13.4)
+        CUDA_TAG=cu134
+        ;;
     *)
         echo "Unsupported CUDA version: ${CUDA_VERSION}" >&2
         exit 2
         ;;
 esac
+
+# CUDA 13.4 has no stable torch channel. The wheel links libtorch and records a
+# hard torch==<version> pin, so it must be built against the same nightly the
+# consuming image installs.
+if [[ "${CUDA_VERSION}" == 13.4 ]]; then
+    TORCH_VERSION="${TORCH_VERSION:-2.15.0.dev20260818+cu134}"
+else
+    TORCH_VERSION="${TORCH_VERSION:-2.13.0}"
+fi
 
 case "${ARCHITECTURE}" in
     x86_64)
@@ -95,6 +107,24 @@ IMAGE_TAG="sgl-deep-ep-builder:cuda${CUDA_VERSION}-${PYTHON_TAG}-${ARCHITECTURE}
 DIST_DIR="${DEEPEP_SOURCE}/dist"
 PYPI_DIST_DIR="${DEEPEP_SOURCE}/dist-pypi"
 
+# torch >= 2.14 headers require C++20; DeepEP hardcodes -std=c++17. The packaging
+# overlay's CUDA case also predates 13.4 and rejects it.
+if [[ "${CUDA_VERSION}" == 13.4 ]]; then
+    sed -i 's/"-std=c++17"/"-std=c++20"/g' "${DEEPEP_SOURCE}/setup.py"
+    overlay_build="${PACKAGING_OVERLAY}/build_sgl_deep_ep.sh"
+    if ! grep -q '13\.4' "${overlay_build}"; then
+        python3 - "${overlay_build}" <<'EOPY'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1]); s = p.read_text()
+old = '    *)\n        echo "Unsupported CUDA version: ${CUDA_VERSION}; expected 12.9 or 13.0"'
+new = ('    13.4|13.4.*)\n        CUDA_MAJOR=13\n        CUDA_TAG=cu134\n        ;;\n'
+       '    *)\n        echo "Unsupported CUDA version: ${CUDA_VERSION}; expected 12.9, 13.0 or 13.4"')
+assert old in s, "DeepEP packaging CUDA case changed shape; update this patch"
+p.write_text(s.replace(old, new))
+EOPY
+    fi
+fi
+
 mkdir -p "${DIST_DIR}" "${PYPI_DIST_DIR}"
 
 echo "----------------------------------------"
@@ -114,7 +144,7 @@ docker build \
     --build-arg CUDA_TAG="${CUDA_TAG}" \
     --build-arg PYTHON_TAG="${PYTHON_TAG}" \
     --build-arg ARCHITECTURE="${ARCHITECTURE}" \
-    --build-arg TORCH_VERSION="${TORCH_VERSION:-2.13.0}" \
+    --build-arg TORCH_VERSION="${TORCH_VERSION}" \
     --tag "${IMAGE_TAG}" \
     --network=host \
     "${REPOSITORY_ROOT}/docker"

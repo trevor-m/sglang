@@ -17,8 +17,11 @@ else
 fi
 
 # Create cache directories for persistent build artifacts in home directory
-# Using home directory to persist across workspace cleanups/checkouts
-CACHE_DIR="${HOME}/.cache/sgl-kernel"
+# Using home directory to persist across workspace cleanups/checkouts.
+# Set SGL_KERNEL_CACHE_DIR to relocate: the ccache dir is bind-mounted into the
+# build container, which fails if $HOME is on NFS the docker daemon cannot
+# traverse, or is too small for CCACHE_MAXSIZE (10G).
+CACHE_DIR="${SGL_KERNEL_CACHE_DIR:-${HOME}/.cache/sgl-kernel}"
 BUILDX_CACHE_DIR="${CACHE_DIR}/buildx"
 CCACHE_HOST_DIR="${CACHE_DIR}/ccache"
 mkdir -p "${BUILDX_CACHE_DIR}" "${CCACHE_HOST_DIR}"
@@ -113,6 +116,7 @@ docker run --rm \
   -w /sgl-kernel \
   -e ARCH="${ARCH}" \
   -e GITHUB_ARTIFACTORY="${GITHUB_ARTIFACTORY_FLAG}" \
+  -e CMAKE_ARGS="${CMAKE_ARGS:-}" \
   "${DEPS_TAG}" \
   bash -c '
 set -eux
@@ -135,7 +139,9 @@ if [ "${USE_CCACHE}" = "1" ]; then
   ccache -sV
 fi
 
-if [ "'"${ARCH}"'" = "aarch64" ]; then
+if [ "'"${ARCH}"'" = "aarch64" ] && ! [ "${BUILD_JOBS}" -gt 0 ] 2>/dev/null; then
+  # Conservative default tuned for the memory-constrained arm CI runners.
+  # Set BUILD_JOBS to override on a bigger host.
   export CUDA_NVCC_FLAGS="-Xcudafe --threads=8"
   export MAKEFLAGS="-j8"
   export CMAKE_BUILD_PARALLEL_LEVEL=2

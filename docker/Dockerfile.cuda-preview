@@ -1,0 +1,83 @@
+# CUDA 13.4 developer preview base image, a stand-in for the
+# nvidia/cuda:*-cudnn-devel-ubuntu24.04 images docker/Dockerfile uses by default.
+# NVIDIA publishes no nvidia/cuda:13.4.* image yet, so build one from Ubuntu and
+# the public preview packages, then pass it in:
+#
+#   docker build -f docker/Dockerfile.cuda-preview -t sglang-cu134-base:local .
+#   docker build -f docker/Dockerfile --build-arg CUDA_VERSION=13.4.0 \
+#       --build-arg BASE_IMAGE=sglang-cu134-base:local ...
+#
+# This ships no cuDNN; torch's vendored nvidia-cudnn-cu13 is what sglang loads.
+ARG UBUNTU_BASE_IMAGE=ubuntu:24.04
+ARG CUDA_PKG_VERSION=13-4
+ARG CUDA_PREVIEW_REPO=https://packages.nvidia.com/noble
+ARG CUDA_PREVIEW_SUITE=prerelease/cuda/13.4.0
+
+FROM ${UBUNTU_BASE_IMAGE}
+
+ARG CUDA_PKG_VERSION
+ARG CUDA_PREVIEW_REPO
+ARG CUDA_PREVIEW_SUITE
+
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates wget gnupg \
+    && wget -q -O /tmp/nvidia-preview-keyring.deb "${CUDA_PREVIEW_REPO}/nvidia-preview-keyring.deb" \
+    && dpkg -i /tmp/nvidia-preview-keyring.deb \
+    && rm -f /tmp/nvidia-preview-keyring.deb \
+    && printf '%s\n' \
+        'X-Repolib-Name: NVIDIA Packages (frozen)' \
+        'Types: deb' \
+        "URIs: ${CUDA_PREVIEW_REPO}" \
+        "Suites: ${CUDA_PREVIEW_SUITE}" \
+        'Components: main' \
+        'Signed-By: /usr/share/keyrings/nvidia-packages-preview.gpg' \
+        'Enabled: yes' \
+        > /etc/apt/sources.list.d/nvidia-packages-preview.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends "cuda-toolkit-${CUDA_PKG_VERSION}" \
+    && cuda_dir="$(ls -d /usr/local/cuda-1* 2>/dev/null | head -1)" \
+    && test -n "${cuda_dir}" \
+    && ln -sfn "${cuda_dir}" /usr/local/cuda \
+    && /usr/local/cuda/bin/nvcc --version \
+    && rm -rf /var/lib/apt/lists/*
+
+# The 13.4 preview repo ships no NCCL, but later stages need libnccl2 /
+# libnccl-dev: pynccl_allocator JIT-compiles with -lnccl under symmetric memory.
+# The repo must be removed again in this same layer, not left behind an apt pin:
+# the devtools repo that nsight-systems-cli adds later publishes byte-identical
+# release metadata (o=NVIDIA, l=NVIDIA CUDA, c=) on this same host, so any pin
+# that stops the CUDA repo's older cuda-* packages from shadowing the 13.4
+# toolkit also blocks nsight-systems-cli. Removal is safe: the later
+# `apt-get install libnccl2 libnccl-dev` resolves from dpkg status.
+RUN export DEBIAN_FRONTEND=noninteractive \
+    && case "$(dpkg --print-architecture)" in \
+         arm64) repo_arch=sbsa ;; \
+         amd64) repo_arch=x86_64 ;; \
+         *) echo "unsupported arch: $(dpkg --print-architecture)" >&2; exit 1 ;; \
+       esac \
+    && wget -q -O /tmp/cuda-keyring.deb \
+        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${repo_arch}/cuda-keyring_1.1-1_all.deb" \
+    && dpkg -i /tmp/cuda-keyring.deb \
+    && rm -f /tmp/cuda-keyring.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends libnccl2 libnccl-dev \
+    && test -e "/usr/lib/$(uname -m)-linux-gnu/libnccl.so" \
+    && rm -f /etc/apt/sources.list.d/cuda*.list /etc/apt/sources.list.d/cuda*.sources \
+    && dpkg -r cuda-keyring \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV PATH=/usr/local/cuda/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64 \
+    NVIDIA_VISIBLE_DEVICES=all \
+    NVIDIA_DRIVER_CAPABILITIES=compute,utility
+
+# nvidia-cutlass-dsl 4.6.2 has no sm_107 in its Arch enum, so on Rubin every
+# CuTe DSL kernel dies with `KeyError: 'sm_107a'` at JIT compile. sm_100f is the
+# family target covering all sm_10x; sm_100a would be arch-specific. Both DSL
+# singletons need setting -- CUTE_DSL_ARCH for CuTeDSL and
+# CUTE_EXPERIMENTAL_DSL_ARCH for CuteExperimentalDSL (the default bf16 GEMM) --
+# since either alone leaves the other half failing.
+# Drop both once a cutlass-dsl release knows sm_107 natively.
+ENV CUTE_DSL_ARCH=sm_100f \
+    CUTE_EXPERIMENTAL_DSL_ARCH=sm_100f

@@ -1,7 +1,7 @@
 name: Release Docker Images Nightly (CUDA 13.4 Rubin)
 #
 # Builds and publishes nightly CUDA 13.4 / Rubin (sm_107) images from
-# docker/Dockerfile.cu134, aarch64 only:
+# docker/Dockerfile, aarch64 only:
 #   - lmsysorg/sglang:nightly-cu134-{date}-{sha}
 #   - lmsysorg/sglang:nightly-cu134
 #
@@ -43,10 +43,53 @@ jobs:
         run: rm -rf /opt/hostedtoolcache
 
       - name: Cleanup workspace (remove root-owned files from prior runs)
-        run: sudo rm -rf "$GITHUB_WORKSPACE"/* || true
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
 
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Checkout DeepGEMM
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepGEMM
+          ref: dev
+          path: DeepGEMM
+          submodules: recursive
+
+      - name: Checkout DeepEP implementation
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: sgl-deepep
+          path: DeepEP-source
+          submodules: recursive
+
+      - name: Checkout DeepEP packaging overlay
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: sgl-deepep-packaging
+          path: DeepEP-packaging
+          sparse-checkout: sgl_deep_ep
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Free Docker disk space
+        run: |
+          set -x
+          docker image prune -f
+          for b in $(docker buildx ls --format '{{.Name}}' | grep -E '^builder-' || true); do
+            docker buildx rm "$b" || true
+          done
+          if [ -d "$HOME/.cache/sgl-kernel/buildx/blobs" ]; then
+            find "$HOME/.cache/sgl-kernel/buildx/blobs" -type f -mtime +14 -delete
+          fi
+          df -h /
 
       - name: Compute image metadata
         id: meta
@@ -66,6 +109,52 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # No nvidia/cuda:13.4.* image exists; build a stand-in from the preview packages
+      - name: Build CUDA 13.4 base image
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --builder default \
+            --progress=plain \
+            --platform linux/arm64 \
+            -f docker/Dockerfile.cuda-preview \
+            -t sglang-cu134-base:${{ github.sha }} \
+            .
+
+      # No published cu134 wheels: these link libtorch and must be built against
+      # the same nightly the image installs
+      - name: Build sglang-kernel wheel
+        env:
+          CMAKE_ARGS: -DSGL_KERNEL_CXX_STANDARD=20
+          USE_CCACHE: 1
+        working-directory: python/sglang/kernels/aot
+        run: ./build.sh 3.12 13.4 aarch64
+
+      - name: Build sgl-deep-gemm wheel
+        run: |
+          set -euo pipefail
+          chmod +x ./scripts/build_sgl_deep_gemm.sh ./scripts/rename_sgl_deep_gemm_whl.sh
+          ./scripts/build_sgl_deep_gemm.sh 3.12 13.4 "${{ github.workspace }}/DeepGEMM" aarch64
+
+      - name: Build sgl-deep-ep wheel
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build_sgl_deepep.sh DeepEP-packaging/sgl_deep_ep/build_sgl_deep_ep.sh
+          scripts/build_sgl_deepep.sh 3.12 13.4 \
+            "${{ github.workspace }}/DeepEP-source" \
+            "${{ github.workspace }}/DeepEP-packaging/sgl_deep_ep" \
+            aarch64
+
+      - name: Collect wheels
+        run: |
+          set -euo pipefail
+          mkdir -p wheel-ctx/wheels
+          cp python/sglang/kernels/aot/dist/*.whl wheel-ctx/wheels/
+          cp DeepGEMM/dist/*.whl                   wheel-ctx/wheels/
+          cp DeepEP-source/dist/*.whl              wheel-ctx/wheels/
+          ls -la wheel-ctx/wheels
+          test "$(ls wheel-ctx/wheels/*.whl | wc -l)" -eq 3
+
       - name: Build image
         run: |
           set -euo pipefail
@@ -74,10 +163,13 @@ jobs:
             --progress=plain \
             --platform linux/arm64 \
             --target "${{ inputs.docker_target || 'runtime' }}" \
+            --build-arg CUDA_VERSION=13.4.0 \
+            --build-arg BASE_IMAGE=sglang-cu134-base:${{ github.sha }} \
             --build-arg BRANCH_TYPE=local \
             --build-arg BUILD_TYPE=all \
             --build-arg BUILD_JOBS="$(nproc)" \
-            -f docker/Dockerfile.cu134 \
+            --build-context sgl_wheels=./wheel-ctx \
+            -f docker/Dockerfile \
             -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag }}" \
             -t "${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.tag_rolling }}" \
             .

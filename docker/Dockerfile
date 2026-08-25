@@ -1,5 +1,21 @@
 ARG CUDA_VERSION=13.0.3
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
+# Override for CUDA versions with no published nvidia/cuda image; see
+# docker/Dockerfile.cuda-preview (CUDA 13.4 / Rubin).
+ARG BASE_IMAGE=nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04
+
+# CUDA 13.4 only: torch publishes no stable cu134 channel, so pin one nightly
+# snapshot. torchvision dev(N) pins torch dev(N-1), hence the differing dates.
+ARG TORCH_NIGHTLY_INDEX=https://download.pytorch.org/whl/nightly/cu134
+ARG TORCH_NIGHTLY_VERSION=2.15.0.dev20260818+cu134
+ARG TORCHVISION_NIGHTLY_VERSION=0.30.0.dev20260819+cu134
+ARG TORCHAUDIO_NIGHTLY_VERSION=2.11.0.dev20260818+cu134
+
+# Pre-built sglang-kernel / sgl-deep-gemm / sgl-deep-ep wheels, overridden with
+# --build-context sgl_wheels=<dir> (wheels in <dir>/wheels). Empty by default.
+FROM ${BASE_IMAGE} AS sgl_wheels
+RUN mkdir -p /wheels
+
+FROM ${BASE_IMAGE} AS base
 
 ARG TARGETARCH
 ARG BUILD_TYPE=all
@@ -171,8 +187,15 @@ ARG CUDA_VERSION
 ARG BUILD_TYPE
 ARG SGL_KERNEL_VERSION
 ARG GITHUB_ARTIFACTORY
+ARG TORCH_NIGHTLY_INDEX
+ARG TORCH_NIGHTLY_VERSION
+ARG TORCHVISION_NIGHTLY_VERSION
+ARG TORCHAUDIO_NIGHTLY_VERSION
 
 WORKDIR /sgl-workspace
+
+# Empty unless --build-context sgl_wheels=<dir> supplies pre-built wheels.
+COPY --from=sgl_wheels /wheels /tmp/sgl_wheels
 
 # Rust toolchain for setuptools-rust extensions (e.g. sglang-grpc).
 # Requires >= 1.85 (edition 2024). Inherited by framework via FROM torch_deps.
@@ -188,6 +211,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         12.6.3) CUINDEX=126 ;; \
         12.9.2) CUINDEX=129 ;; \
         13.0.3) CUINDEX=130 ;; \
+        13.4.0) CUINDEX=134 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && if [ "$CUDA_VERSION" = "12.6.3" ]; then \
@@ -199,6 +223,11 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     elif [ "$CUDA_VERSION" = "13.0.3" ]; then \
         # --no-deps prevents pip from pulling torch from default PyPI
         python3 -m pip install sglang-kernel==${SGL_KERNEL_VERSION} --force-reinstall --no-deps \
+    ; \
+    elif [ "$CUDA_VERSION" = "13.4.0" ]; then \
+        # No published cu134 wheels; these are built by the caller and supplied
+        # via --build-context sgl_wheels.
+        python3 -m pip install --force-reinstall --no-deps /tmp/sgl_wheels/*.whl \
     ; \
     else \
         echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 \
@@ -224,6 +253,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         12.6.3) CUINDEX=126 ;; \
         12.9.2) CUINDEX=129 ;; \
         13.0.3) CUINDEX=130 ;; \
+        13.4.0) CUINDEX=134 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && cd /tmp/sglang_deps/python \
@@ -245,7 +275,23 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i 's/flashinfer_python\[cu13\]/flashinfer_python[cu12]/' pyproject.toml && \
            sed -i 's/nvidia-cutlass-dsl\[cu13\]/nvidia-cutlass-dsl/' pyproject.toml; \
        fi \
-    && python3 -m pip install --extra-index-url https://download.pytorch.org/whl/cu${CUINDEX} ".[${BUILD_TYPE}]" \
+    && if [ "$CUDA_VERSION" = "13.4.0" ]; then \
+           TORCH_INDEX="${TORCH_NIGHTLY_INDEX}"; \
+           python3 -m pip install --index-url "${TORCH_NIGHTLY_INDEX}" \
+               "torch==${TORCH_NIGHTLY_VERSION}" \
+               "torchvision==${TORCHVISION_NIGHTLY_VERSION}" \
+               "torchaudio==${TORCHAUDIO_NIGHTLY_VERSION}" && \
+           sed -i "s|^  \"torch==.*|  \"torch==${TORCH_NIGHTLY_VERSION}\",|" pyproject.toml && \
+           sed -i "s|^  \"torchaudio==.*|  \"torchaudio==${TORCHAUDIO_NIGHTLY_VERSION}\",|" pyproject.toml && \
+           sed -i "s|^  \"torchvision\",\$|  \"torchvision==${TORCHVISION_NIGHTLY_VERSION}\",|" pyproject.toml && \
+           sed -i 's|"torchcodec==[0-9.]*|"torchcodec|' pyproject.toml && \
+           sed -i 's|^  "sglang-kernel==.*|  "sglang-kernel",|' pyproject.toml && \
+           sed -i 's|^  "sgl-deep-ep==.*|  "sgl-deep-ep",|' pyproject.toml && \
+           sed -i 's|^  "sgl-deep-gemm==.*|  "sgl-deep-gemm",|' pyproject.toml; \
+       else \
+           TORCH_INDEX="https://download.pytorch.org/whl/cu${CUINDEX}"; \
+       fi \
+    && python3 -m pip install --extra-index-url "${TORCH_INDEX}" ".[${BUILD_TYPE}]" \
     && if [ "${CUDA_VERSION%%.*}" = "12" ]; then \
            pip list --format=freeze | awk -F'==' '/-cu13(==|$)/ {print $1}' \
                | xargs -r python3 -m pip uninstall -y && \
@@ -260,6 +306,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # distro resolves to the apt python3-distro under /usr/lib/python3, which the runtime
 # stage does not COPY; force a pip copy into /usr/local so it survives the stage split.
 RUN python3 -m pip install --ignore-installed --no-deps distro
+
+# constraints.txt pins the cu134 nightly torch, which does not exist on PyPI;
+# later stages cannot satisfy it without the nightly index in scope.
+RUN if [ "$CUDA_VERSION" = "13.4.0" ]; then \
+        python3 -m pip config set global.extra-index-url "${TORCH_NIGHTLY_INDEX}"; \
+    fi
 
 ########################################################
 # PARALLEL STAGE 2: HPC-Ops Builder (needs torch_deps)
@@ -300,6 +352,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
         12.6.3) CUINDEX=126 ;; \
         12.9.2) CUINDEX=129 ;; \
         13.0.3) CUINDEX=130 ;; \
+        13.4.0) CUINDEX=134 ;; \
         *) echo "Unsupported CUDA version: $CUDA_VERSION" && exit 1 ;; \
     esac \
     && mkdir -p /flashinfer_jit_output \
@@ -411,6 +464,7 @@ ARG MSCCLPP_VERSION
 # Renamed from NCCL_VERSION: the nvidia/cuda base image sets ENV NCCL_VERSION
 # (Debian apt format, e.g. 2.28.3-1), which shadows a same-named ARG inside RUN.
 ARG SGL_NCCL_VERSION
+ARG TORCH_NIGHTLY_VERSION
 
 WORKDIR /sgl-workspace
 
@@ -511,8 +565,14 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     && rm -rf /tmp/mscclpp
 
 # Install essential Python packages (use constraints to prevent conflicts)
+#
+# pip only considers pre-release candidates when the requirement itself names
+# one, so the constraints-pinned cu134 nightly must be restated here; otherwise
+# runai-model-streamer's "torch<3.0.0,>=2.0.0" backtracks the whole resolve.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    python3 -m pip install -c /sgl-workspace/constraints.txt \
+    if [ "$CUDA_VERSION" = "13.4.0" ]; then TORCH_SPEC="torch==${TORCH_NIGHTLY_VERSION}"; else TORCH_SPEC=""; fi \
+    && python3 -m pip install -c /sgl-workspace/constraints.txt \
+    ${TORCH_SPEC} \
     datamodel_code_generator \
     pre-commit \
     pytest \
@@ -693,7 +753,7 @@ LABEL org.opencontainers.image.source="https://github.com/sgl-project/sglang" \
 # - Ready-to-run inference server environment
 #
 # Note: Uses devel base for complete NVCC toolchain required by DeepGEMM JIT
-FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS runtime
+FROM ${BASE_IMAGE} AS runtime
 
 ARG CUDA_VERSION
 ARG TARGETARCH

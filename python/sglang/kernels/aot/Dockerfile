@@ -94,13 +94,18 @@ RUN set -eux; \
     ln -sf /usr/local/cuda-${CUDA_VERSION}/targets/${_LIB}-linux/lib/stubs/libcuda.so /usr/lib/${ARCH}-linux-gnu/libcuda.so
 
 # Install Python dependencies (torch + build tools)
+# TORCH_VERSION_OVERRIDE pins an exact build (e.g. a cu134 nightly). It must
+# match the torch the consuming image installs, since the wheel links libtorch.
+ARG TORCH_VERSION_OVERRIDE=
 RUN --mount=type=cache,id=sgl-kernel-pip,target=/root/.cache/pip \
     set -eux; \
     case "${CUDA_VERSION}" in \
+      13.4) TORCH_VER=2.15.0.dev20260818+cu134; CU_TAG=nightly/cu134 ;; \
       13.0) TORCH_VER=2.13.0; CU_TAG=cu130 ;; \
       12.9) TORCH_VER=2.13.0; CU_TAG=cu129 ;; \
       *)    TORCH_VER=2.13.0; CU_TAG=cu126 ;; \
     esac; \
+    if [ -n "${TORCH_VERSION_OVERRIDE}" ]; then TORCH_VER="${TORCH_VERSION_OVERRIDE}"; fi; \
     ${PYTHON_ROOT_PATH}/bin/pip install torch==${TORCH_VER} --index-url ${PYTORCH_INDEX_BASE}/${CU_TAG}; \
     ${PYTHON_ROOT_PATH}/bin/pip install ninja setuptools==75.0.0 wheel==0.41.0 numpy uv scikit-build-core --index-url ${PIP_DEFAULT_INDEX}
 

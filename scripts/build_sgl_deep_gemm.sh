@@ -24,6 +24,7 @@ DEEPGEMM_SRC="$(cd "$3" && pwd)"
 ARCH="${4:-$(uname -i)}"
 
 case "${CUDA_VERSION}" in
+  13.4) CU_TAG=cu134 ;;
   13.0) CU_TAG=cu130 ;;
   12.9) CU_TAG=cu129 ;;
   *)
@@ -31,6 +32,10 @@ case "${CUDA_VERSION}" in
     exit 1
     ;;
 esac
+
+# CUDA 13.4 has no stable torch channel; the wheel links libtorch, so it must be
+# built against the same nightly the consuming image installs.
+TORCH_VER="${TORCH_VER:-$([ "${CUDA_VERSION}" = 13.4 ] && echo 2.15.0.dev20260818+cu134 || echo 2.13.0)}"
 
 if [ "${ARCH}" = "aarch64" ]; then
   BASE_IMG="pytorch/manylinuxaarch64-builder"
@@ -64,8 +69,17 @@ docker build \
   --build-arg ARCH="${ARCH}" \
   --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
   --build-arg PYTHON_TAG="${PY_TAG}" \
+  --build-arg TORCH_VER="${TORCH_VER}" \
   -t "${DEPS_TAG}" \
   --network=host
+
+# torch >= 2.14 headers require C++20; DeepGEMM hardcodes -std=c++17.
+if [ "${CUDA_VERSION}" = "13.4" ]; then
+  ( cd "${DEEPGEMM_SRC}" \
+    && sed -i "s/'-std=c++17'/'-std=c++20'/g" \
+         build_sgl_deep_gemm.sh setup.py sgl_deep_gemm/__init__.py \
+    && printf '%s' "${SGL_DEEP_GEMM_VERSION:-0.1.5.post2}" > sgl_deep_gemm/VERSION )
+fi
 
 mkdir -p "${DEEPGEMM_SRC}/dist"
 

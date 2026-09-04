@@ -54,6 +54,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 from sglang.srt.utils import add_prefix, is_cuda, is_hip, is_xpu
+from sglang.srt.utils.async_probe import maybe_detect_nan, maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
@@ -912,8 +913,24 @@ class C4IndexerBackendMixin:
 
         all_rows = slice(0, _c4sl.shape[0])
 
+        # Upper bound for the transform's output slot ids, which address the c4
+        # indexer K pool (sized c4_logical_size slots), not the SWA pool.
+        c4_slot_limit = token_to_kv_pool.c4_logical_size + indexer_metadata.c4_page_size
+
         def run_topk_transform(rows: slice, logits: torch.Tensor) -> None:
             row_raw_indices = raw_indices[rows] if raw_indices is not None else None
+            # A negative length reinterprets as ~4e9 in the v2 kernel (it reads
+            # lengths as uint32_t), sending the row down the cluster path over
+            # garbage scores; see topk_transform_paged_v2's contract.
+            maybe_detect_oob(
+                c4_seq_lens[rows],
+                0,
+                page_table.shape[1] * indexer_metadata.c4_page_size + 1,
+                "c4 indexer: seq lens into top-k",
+            )
+            # Separates scores that arrive poisoned from the upstream paged-MQA
+            # logits step from indices the transform itself got wrong.
+            maybe_detect_nan(logits, "c4 indexer: logits before top-k")
             # The cached plan routes rows by their index in the full range, so a
             # chunk needs one built over its own rows.
             topk_metadata = (
@@ -931,6 +948,14 @@ class C4IndexerBackendMixin:
                 page_size=indexer_metadata.c4_page_size,
                 topk_metadata=topk_metadata,
                 raw_indices=row_raw_indices,
+            )
+            # -1 is the transform's sentinel for an unused top-k slot, so the
+            # low bound catches only indices below it.
+            maybe_detect_oob(
+                c4_sparse_page_indices[rows],
+                -1,
+                c4_slot_limit,
+                "c4 indexer: sparse page indices after top-k",
             )
 
         if nonpaged_plan is not None:

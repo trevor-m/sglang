@@ -2563,7 +2563,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             get_moe_runner_backend().is_flashinfer_trtllm()
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         ) and self._owns_moe_runner:
-            if self.block_quant and not self.use_mxfp8:
+            if self.block_quant and not self.use_mxfp8 and not self.is_fp4_expert:
                 # DeepSeek 128x128 block FP8 is consumed unshuffled; FlashInfer
                 # has no partitioned Prims-TS runner for that layout.
                 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm_locality import (

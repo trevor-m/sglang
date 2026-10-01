@@ -295,6 +295,28 @@ class TestMoeLocalityWeightSharding(_LocalityTestCase):
             with self.assertRaises(RuntimeError):
                 param.data.copy_(tensor)
 
+    def test_scale_attrs_select_which_scale_params_are_sharded_and_released(self):
+        """FP8 checkpoints with MXFP4 experts keep scales under *_weight_scale_inv;
+        sharding must read and release exactly the named pair."""
+        layer = _nvfp4_trtllm_layer()
+        layer.w13_weight_scale_inv = layer.w13_weight_scale
+        layer.w2_weight_scale_inv = layer.w2_weight_scale
+        untouched = _param(torch.zeros(2, 2, dtype=torch.float8_e4m3fn))
+        layer.w13_weight_scale = untouched
+        layer.w2_weight_scale = untouched
+
+        locality.partition_fp4_moe_weights_for_locality(
+            layer,
+            scale_k_group_size=32,
+            scale_attrs=("w13_weight_scale_inv", "w2_weight_scale_inv"),
+        )
+
+        shards = layer.moe_locality_shards
+        self.assertEqual(len(shards.fc1_scale), PARTITION_COUNT)
+        self.assertEqual(layer.w13_weight_scale_inv.data.untyped_storage().nbytes(), 1)
+        self.assertIs(layer.w13_weight_scale, untouched)
+        self.assertEqual(untouched.data.untyped_storage().nbytes(), 4)
+
     def test_partition_handle_is_process_wide(self):
         """Two layers share one LocalizedDomains / MoePartitionResources pair.
 

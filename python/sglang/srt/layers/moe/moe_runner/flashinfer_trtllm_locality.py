@@ -336,10 +336,20 @@ def _release_and_record(
     )
 
 
+_FP4_SCALE_ATTRS = ("w13_weight_scale", "w2_weight_scale")
+
+
 def partition_fp4_moe_weights_for_locality(
-    layer: Module, *, scale_k_group_size: int
+    layer: Module,
+    *,
+    scale_k_group_size: int,
+    scale_attrs: tuple[str, str] = _FP4_SCALE_ATTRS,
 ) -> None:
-    """Shard TRT-LLM-prepared packed FP4 weights (NVFP4: group 16, MXFP4: 32)."""
+    """Shard TRT-LLM-prepared packed FP4 weights (NVFP4: group 16, MXFP4: 32).
+
+    ``scale_attrs`` names the interleaved block-scale parameters; the MXFP4
+    experts of FP8 checkpoints keep theirs under ``*_weight_scale_inv``.
+    """
     if not _should_partition(layer):
         return
     _require_gated(layer, "FP4")
@@ -351,21 +361,20 @@ def partition_fp4_moe_weights_for_locality(
             "FP4 locality partitioning expects packed uint8 weights, got "
             f"{w13_weight.dtype} / {w2_weight.dtype}"
         )
+    w13_scale_attr, w2_scale_attr = scale_attrs
     shards = shard_prepared_moe_weights_for_locality(
         fc1_weight=w13_weight,
         fc2_weight=w2_weight,
         hidden_size=int(w2_weight.shape[1]),
         intermediate_size=int(w2_weight.shape[2]) * 2,
         weight_layout=_WEIGHT_LAYOUT_MAJOR_K,
-        fc1_scale=layer.w13_weight_scale.data.view(torch.float8_e4m3fn),
-        fc2_scale=layer.w2_weight_scale.data.view(torch.float8_e4m3fn),
+        fc1_scale=getattr(layer, w13_scale_attr).data.view(torch.float8_e4m3fn),
+        fc2_scale=getattr(layer, w2_scale_attr).data.view(torch.float8_e4m3fn),
         scale_k_group_size=scale_k_group_size,
         scale_dtype=torch.float8_e4m3fn,
     )
     _release_and_record(
-        layer,
-        shards,
-        ("w13_weight", "w2_weight", "w13_weight_scale", "w2_weight_scale"),
+        layer, shards, ("w13_weight", "w2_weight", w13_scale_attr, w2_scale_attr)
     )
 
 
@@ -692,6 +701,73 @@ def run_locality_partitioned_mxfp4_moe(
     if kernel_output is not output:
         output.copy_(kernel_output[:, : output.shape[-1]])
     return output
+
+
+def run_locality_partitioned_mxfp4_routed_moe(
+    *,
+    shards: MoeLocalityShards,
+    topk_ids: torch.Tensor,
+    topk_weights: torch.Tensor,
+    hidden_states: torch.Tensor,
+    hidden_states_scale: Optional[torch.Tensor],
+    output1_scale_scalar: torch.Tensor,
+    output1_scale_gate_scalar: torch.Tensor,
+    output2_scale_scalar: torch.Tensor,
+    gemm1_clamp_limit: Optional[torch.Tensor],
+    num_experts: int,
+    intermediate_size: int,
+    local_expert_offset: int,
+    local_num_experts: int,
+    defer_finalize: bool,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """MXFP4-expert routed forward (``Mxfp4FlashinferTrtllmMoEMethod``).
+
+    Mirrors that method's ``trtllm_fp4_block_scale_routed_moe`` call: unpacked
+    (ids, weights) routing, TopK routing method with unit scaling, and MXFP8
+    or BF16 activations.
+    """
+    from flashinfer.fused_moe import prims_ts_fp4_block_scale_moe_partitioned
+
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    _require_finalize(defer_finalize, "MXFP4")
+    num_tokens = hidden_states.shape[0]
+    result = prims_ts_fp4_block_scale_moe_partitioned(
+        routing_logits=None,
+        routing_bias=None,
+        topk_ids=topk_ids,
+        topk_weights=topk_weights,
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_weights=list(shards.fc1),
+        gemm1_weights_scale=list(shards.fc1_scale),
+        gemm2_weights=list(shards.fc2),
+        gemm2_weights_scale=list(shards.fc2_scale),
+        output1_scale_scalar=output1_scale_scalar,
+        output1_scale_gate_scalar=output1_scale_gate_scalar,
+        output2_scale_scalar=output2_scale_scalar,
+        num_experts=num_experts,
+        top_k=int(topk_ids.shape[1]),
+        n_group=1,
+        topk_group=1,
+        intermediate_size=intermediate_size,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=local_num_experts,
+        partition_resources=shards.resources,
+        partition_strategy=shards.strategy,
+        routed_scaling_factor=1.0,
+        routing_method_type=int(RoutingMethodType.TopK),
+        weight_layout=_WEIGHT_LAYOUT_MAJOR_K,
+        do_finalize=True,
+        enable_pdl=_enable_pdl(num_tokens),
+        output=output,
+        tune_max_num_tokens=next_power_of_2(num_tokens),
+        gemm1_alpha=None,
+        gemm1_beta=None,
+        gemm1_clamp_limit=gemm1_clamp_limit,
+    )
+    return _unwrap_output(result, output)
 
 
 def run_locality_partitioned_fp8_moe(

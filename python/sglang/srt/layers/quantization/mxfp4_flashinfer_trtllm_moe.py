@@ -311,6 +311,18 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         )
 
         self._register_static_scale_ones(layer)
+
+        # --enable-moe-locality-partition: shard the shuffled weights and
+        # interleaved scales into the locality domains and release the copies.
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm_locality import (
+            partition_fp4_moe_weights_for_locality,
+        )
+
+        partition_fp4_moe_weights_for_locality(
+            layer,
+            scale_k_group_size=32,
+            scale_attrs=("w13_weight_scale_inv", "w2_weight_scale_inv"),
+        )
         torch.cuda.empty_cache()
 
     def _register_static_scale_ones(self, layer: Module) -> None:
@@ -438,6 +450,30 @@ class Mxfp4FlashinferTrtllmMoEMethod:
         if input_ready is not None:
             # The op launches the routing kernel, so the join must precede it.
             torch.cuda.current_stream().wait_event(input_ready)
+
+        if layer.moe_locality_shards is not None:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm_locality import (
+                run_locality_partitioned_mxfp4_routed_moe,
+            )
+
+            output = run_locality_partitioned_mxfp4_routed_moe(
+                shards=layer.moe_locality_shards,
+                topk_ids=topk_ids,
+                topk_weights=topk_weights,
+                hidden_states=x_quant,
+                hidden_states_scale=x_scale,
+                output1_scale_scalar=layer.output1_scale_scalar,
+                output1_scale_gate_scalar=layer.output1_scale_gate_scalar,
+                output2_scale_scalar=layer.output2_scale_scalar,
+                gemm1_clamp_limit=self._gemm1_clamp_limit_tensor,
+                num_experts=layer.num_experts,
+                intermediate_size=intermediate_size,
+                local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                local_num_experts=num_local_experts,
+                defer_finalize=defer_finalize,
+                output=symm_output,
+            )
+            return StandardCombineInput(hidden_states=output)
 
         result = trtllm_fp4_block_scale_routed_moe(
             topk_ids=(topk_ids, topk_weights),

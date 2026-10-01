@@ -266,6 +266,14 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 (layer.w2_input_scale_quant * layer.g1_alphas).to(torch.float32),
                 requires_grad=False,
             )
+
+            # --enable-moe-locality-partition: shard the shuffled weights and
+            # interleaved scales into the locality domains.
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm_locality import (
+                partition_fp4_moe_weights_for_locality,
+            )
+
+            partition_fp4_moe_weights_for_locality(layer, scale_k_group_size=16)
         else:
             # swizzle weight scales
             layer.w13_weight_scale = torch.nn.Parameter(
@@ -340,6 +348,7 @@ class CompressedTensorsW4A4Nvfp4MoE(CompressedTensorsMoEScheme):
                 routing_method_type=layer.routing_method_type,
                 use_per_token_activation=False,
                 gemm1_clamp_limit=None,
+                locality_shards=layer.moe_locality_shards,
             )
             return self.runner.run(dispatch_output, quant_info)
         else:

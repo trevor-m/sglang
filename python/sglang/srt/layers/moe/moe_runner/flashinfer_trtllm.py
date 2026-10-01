@@ -32,6 +32,16 @@ from sglang.srt.layers.moe.moe_runner.base import (
     MoeRunnerConfig,
     register_fused_func,
 )
+from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm_locality import (
+    MoeLocalityShards,
+    partition_fp4_moe_weights_for_locality,
+    partition_fp8_per_tensor_moe_weights_for_locality,
+    partition_mxfp8_moe_weights_for_locality,
+    run_locality_partitioned_bf16_moe,
+    run_locality_partitioned_fp4_moe,
+    run_locality_partitioned_fp8_moe,
+    run_locality_partitioned_mxfp4_moe,
+)
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import (
@@ -327,6 +337,10 @@ def align_fp8_moe_weights_for_flashinfer_trtllm(
     )
     layer.output2_scales_scalar = Parameter(output2_scales_scalar, requires_grad=False)
 
+    # --enable-moe-locality-partition: shard the shuffled weights into the locality
+    # domains and release the full-size copies.
+    partition_fp8_per_tensor_moe_weights_for_locality(layer)
+
 
 def _align_mxfp8_moe_weights(
     w13: torch.Tensor,
@@ -509,6 +523,10 @@ def align_mxfp8_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     layer.w13_weight_scale_inv.format_ue8m0 = True
     layer.w2_weight_scale_inv.format_ue8m0 = True
 
+    # --enable-moe-locality-partition: shard the shuffled weights and interleaved
+    # scales into the locality domains and release the full-size copies.
+    partition_mxfp8_moe_weights_for_locality(layer)
+
 
 def _align_fp4_moe_weights(
     w13: torch.Tensor,
@@ -659,6 +677,10 @@ def align_fp4_moe_weights_for_flashinfer_trtllm(layer: Module) -> None:
     # Update intermediate_size_per_partition to reflect any padding applied
     layer.intermediate_size_per_partition = intermediate_size
 
+    # --enable-moe-locality-partition: shard the shuffled weights and interleaved
+    # scales into the locality domains and release the full-size copies.
+    partition_fp4_moe_weights_for_locality(layer, scale_k_group_size=16)
+
 
 def get_activation_type(activation: str, is_gated: bool = True) -> int:
     """Map SGLang activation string to FlashInfer ActivationType int value."""
@@ -721,6 +743,9 @@ class FlashInferTrtllmFp8MoeQuantInfo(MoeQuantInfo):
 
     # Activation type (None = kernel default / Swiglu)
     activation_type: int | None = None
+
+    # --enable-moe-locality-partition: per-domain weight shards (replaces w13/w2).
+    locality_shards: MoeLocalityShards | None = None
 
 
 def fused_experts_none_to_flashinfer_trtllm_fp8(
@@ -825,6 +850,20 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                     dtype=output_dtype,
                     device=hidden_states.device,
                 )
+
+        if quant_info.locality_shards is not None:
+            output = run_locality_partitioned_fp8_moe(
+                shards=quant_info.locality_shards,
+                quant_info=quant_info,
+                runner_config=runner_config,
+                topk_output=topk_output,
+                use_routed_topk=use_routed_topk,
+                defer_finalize=defer_finalize,
+                hidden_states=a_q,
+                hidden_states_scale=a_sf_t,
+                output=cast(torch.Tensor, symm_output),
+            )
+            return StandardCombineInput(hidden_states=output)
 
         # Move kernel call outside context manager to avoid graph breaks
         # during torch.compile for piecewise cuda graph.
@@ -952,6 +991,20 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 device=hidden_states.device,
             )
 
+        if quant_info.locality_shards is not None:
+            output = run_locality_partitioned_fp8_moe(
+                shards=quant_info.locality_shards,
+                quant_info=quant_info,
+                runner_config=runner_config,
+                topk_output=topk_output,
+                use_routed_topk=use_routed_topk,
+                defer_finalize=defer_finalize,
+                hidden_states=a_q,
+                hidden_states_scale=None,
+                output=symm_output,
+            )
+            return StandardCombineInput(hidden_states=output)
+
         # Move kernel call outside context manager to avoid graph breaks
         # during torch.compile for piecewise cuda graph.
         # Use custom op wrapper for torch.compile compatibility.
@@ -1015,6 +1068,9 @@ class FlashInferTrtllmGenMxfp4MoeQuantInfo(MoeQuantInfo):
     hidden_size: int
     flashinfer_mxfp4_moe_precision: str
     routing_bias: Optional[torch.Tensor] = None
+
+    # --enable-moe-locality-partition: per-domain weight shards (replaces w13/w2).
+    locality_shards: Optional[MoeLocalityShards] = None
 
 
 def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
@@ -1091,6 +1147,18 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 dtype=torch.bfloat16,
                 device=x_quant.device,
             )
+
+    if quant_info.locality_shards is not None:
+        output = run_locality_partitioned_mxfp4_moe(
+            shards=quant_info.locality_shards,
+            quant_info=quant_info,
+            runner_config=runner_config,
+            topk_output=topk_output,
+            hidden_states=x_quant,
+            hidden_states_scale=x_scale,
+            output=symm_output,
+        )
+        return StandardCombineInput(hidden_states=output)
 
     if runner_config.activation == "situ":
         from flashinfer import trtllm_fp4_block_scale_moe
@@ -1254,6 +1322,9 @@ class FlashInferTrtllmFp4MoeQuantInfo(MoeQuantInfo):
     gemm1_beta: Optional[torch.Tensor] = None
     gemm1_clamp_limit: Optional[torch.Tensor] = None
 
+    # --enable-moe-locality-partition: per-domain weight shards (replaces w13/w2).
+    locality_shards: Optional[MoeLocalityShards] = None
+
 
 def quantize_hidden_states_fp4(
     hidden_states: torch.Tensor,
@@ -1411,6 +1482,22 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
                     device=hs_fp4.device,
                 )
 
+    if quant_info.locality_shards is not None:
+        result = run_locality_partitioned_fp4_moe(
+            shards=quant_info.locality_shards,
+            quant_info=quant_info,
+            runner_config=runner_config,
+            topk_output=topk_output,
+            use_routed_topk=use_routed_topk,
+            defer_finalize=defer_finalize,
+            hidden_states=hs_fp4,
+            hidden_states_scale=hs_scale,
+            per_token_scale=per_token_scale,
+            activation_type=activation_type,
+            output=cast(torch.Tensor, symm_output),
+        )
+        return StandardCombineInput(hidden_states=result)
+
     if use_routed_topk:
         routing = _get_routing_for_flashinfer_routed(topk_output)
         result = trtllm_fp4_block_scale_routed_moe(
@@ -1513,6 +1600,9 @@ class FlashInferTrtllmBf16MoeQuantInfo(MoeQuantInfo):
     global_num_experts: int
     local_expert_offset: int
 
+    # --enable-moe-locality-partition: per-domain weight shards (replaces gemm1/gemm2).
+    locality_shards: Optional[MoeLocalityShards] = None
+
 
 def fused_experts_none_to_flashinfer_trtllm_bf16(
     dispatch_output: StandardDispatchOutput,
@@ -1562,6 +1652,28 @@ def fused_experts_none_to_flashinfer_trtllm_bf16(
 
     hidden_states = dispatch_output.hidden_states
     topk_output = dispatch_output.topk_output
+
+    if quant_info.locality_shards is not None:
+        with use_symmetric_memory(
+            get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        ):
+            output = torch.empty(
+                hidden_states.shape[0],
+                hidden_states.shape[1],
+                dtype=hidden_states.dtype,
+                device=hidden_states.device,
+            )
+        final_hidden_states = run_locality_partitioned_bf16_moe(
+            shards=quant_info.locality_shards,
+            quant_info=quant_info,
+            runner_config=runner_config,
+            topk_output=topk_output,
+            use_routed_topk=use_routed_topk,
+            hidden_states=hidden_states,
+            activation_type=activation_type,
+            output=output,
+        )
+        return StandardCombineInput(hidden_states=final_hidden_states)
 
     with use_symmetric_memory(
         get_parallel().tp_group, disabled=not is_allocation_symmetric()

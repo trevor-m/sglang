@@ -109,6 +109,7 @@ def _build_mock_layer(num_experts, hidden, inter, fixtures):
     layer.num_experts = num_experts
     layer.num_local_experts = num_experts  # tests run with EP size = 1
     layer.moe_ep_rank = 0
+    layer.moe_locality_shards = None
     return layer
 
 

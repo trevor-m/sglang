@@ -252,6 +252,12 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             lambda: resolved_view(server_args).attn_cp_size > 1,
         ),
         ("CUDA graph debug mode", lambda: cfg.debug_cuda_graph),
+        # The partitioned MoE forks onto green-context streams from Python,
+        # which dynamo cannot trace.
+        (
+            "MoE locality partition",
+            lambda: cfg.enable_moe_locality_partition,
+        ),
         # Capture builds a dummy extend forward with attn_dcp_metadata=None.
         (
             "decode context parallel (dcp_size > 1)",

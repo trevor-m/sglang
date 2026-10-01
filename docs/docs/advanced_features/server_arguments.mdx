@@ -1817,6 +1817,18 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>default</code>, <code>bf16</code>, <code>fp8</code></td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-moe-locality-partition`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Partition every MoE layer's expert weights across the two GPU memory locality domains (the two dies of a Rubin GPU) and run each half's GEMMs on a green-context stream pinned to the SMs local to that domain, via FlashInfer's Prims-TS partitioned MoE (tp_n_tp_n: FC1 and FC2 output rows are sharded, FC2 writes disjoint hidden halves). Requires `--moe-runner-backend flashinfer_trtllm`, `flashinfer_trtllm_routed`, or `flashinfer_mxfp4`, `--moe-a2a-backend none`, a gated activation, a FlashInfer build with `flashinfer.locality_domain`, CUDA 13.4, and a SM100/SM103/SM107 GPU exposing two locality domains. In-place weight updates are not supported while enabled.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--moe-locality-sm-split`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>How `--enable-moe-locality-partition` splits SMs between the two locality-domain green contexts. `backfill` uses every SM, borrowing the device's remainder SMs across domains; `strict` uses only each domain's local SMs and leaves the remainder idle.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`backfill`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>backfill</code>, <code>strict</code></td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-flashinfer-allreduce-fusion`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer allreduce fusion with Residual RMSNorm.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>

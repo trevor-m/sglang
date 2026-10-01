@@ -50,6 +50,7 @@ from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
     validate_deepep_v2_dispatch_token_budget,
     validate_deepep_v2_speculative_draft,
+    validate_moe_locality_partition,
 )
 from sglang.srt.arg_groups.overrides import (
     cutedsl_moe_max_num_tokens,
@@ -4101,6 +4102,90 @@ class TestLazyReexports(CustomTestCase):
     def test_an_unknown_attribute_still_raises(self):
         with self.assertRaises(AttributeError):
             server_args_module.NotAThing
+
+
+class TestMoeLocalityPartitionArgs(CustomTestCase):
+    """--enable-moe-locality-partition only has a kernel behind the FlashInfer
+    TRT-LLM-gen weight layouts; the hook must refuse every other combination."""
+
+    def _view(self, **overrides):
+        fields = dict(
+            moe_runner_backend="flashinfer_trtllm",
+            moe_a2a_backend="none",
+            quantization="modelopt_fp4",
+            enable_torch_compile=False,
+        )
+        fields.update(overrides)
+        return SimpleNamespace(**fields)
+
+    def test_cli_flags_parse(self):
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        args = parser.parse_args(
+            [
+                "--model",
+                "dummy",
+                "--enable-moe-locality-partition",
+                "--moe-locality-sm-split",
+                "strict",
+            ]
+        )
+        server_args = ServerArgs.from_cli_args(args)
+        self.assertTrue(server_args.enable_moe_locality_partition)
+        self.assertEqual(server_args.moe_locality_sm_split, "strict")
+
+    def test_accepts_every_trtllm_gen_runner_backend(self):
+        for backend in (
+            "flashinfer_trtllm",
+            "flashinfer_trtllm_routed",
+            "flashinfer_mxfp4",
+        ):
+            with self.subTest(backend=backend):
+                validate_moe_locality_partition(self._view(moe_runner_backend=backend))
+
+    def test_rejects_other_runner_backends(self):
+        for backend in ("auto", "triton", "flashinfer_cutlass", "flashinfer_cutedsl"):
+            with self.subTest(backend=backend):
+                with self.assertRaisesRegex(ValueError, "moe-runner-backend"):
+                    validate_moe_locality_partition(
+                        self._view(moe_runner_backend=backend)
+                    )
+
+    def test_rejects_a2a_and_torch_compile_and_unsupported_quantization(self):
+        with self.assertRaisesRegex(ValueError, "moe-a2a-backend"):
+            validate_moe_locality_partition(self._view(moe_a2a_backend="deepep"))
+        with self.assertRaisesRegex(ValueError, "torch.compile"):
+            validate_moe_locality_partition(self._view(enable_torch_compile=True))
+        with self.assertRaisesRegex(ValueError, "quantization"):
+            validate_moe_locality_partition(self._view(quantization="awq"))
+        # bfloat16 (no quantization) has the BF16 BlockMajorK path.
+        validate_moe_locality_partition(self._view(quantization=None))
+
+    def test_disables_tc_piecewise_prefill_graph(self):
+        # Same harness as the LoRA rule: hardware rules neutralized for CPU CI.
+        args = ServerArgs(model_path="dummy", enable_moe_locality_partition=True)
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"]),
+            is_piecewise_cuda_graph_disabled_model=False,
+            is_multimodal=False,
+            is_multimodal_piecewise_cuda_graph_supported=False,
+        )
+        args.cuda_graph_config = CudaGraphConfig(
+            prefill=PhaseConfig(backend=Backend.TC_PIECEWISE)
+        )
+        with (
+            override_platform(is_hip=False),
+            override_platform(is_npu=False),
+            patch("sglang.srt.arg_groups.cuda_graph_hook.is_cpu", return_value=False),
+            patch("sglang.srt.arg_groups.cuda_graph_hook.is_mps", return_value=False),
+            override_platform(is_xpu=False),
+        ):
+            disable_tc_piecewise_cudagraph_if_incompatible(args)
+
+        self.assertEqual(
+            resolution_result(args, "cuda_graph_config").prefill.backend,
+            Backend.DISABLED,
+        )
 
 
 if __name__ == "__main__":

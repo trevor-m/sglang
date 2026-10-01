@@ -416,6 +416,10 @@ class FusedMoE(torch.nn.Module):
             or get_moe_runner_backend().is_flashinfer_trtllm_routed()
         )
         self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # Set by the quant method's weight post-processing when
+        # --enable-moe-locality-partition shards this layer's experts across
+        # the GPU locality domains; None means the full-size weights are live.
+        self.moe_locality_shards = None
 
         # flashinfer_trtllm kernel requires intermediate_size to be a multiple of 128
         # Pad the intermediate_size_per_partition if necessary
@@ -1172,6 +1176,13 @@ class FusedMoE(torch.nn.Module):
             method = self.scheme
         if method.__class__.__name__ == "KTEPWrapperMethod":
             method = method.gpu_method
+
+        if self.moe_locality_shards is not None:
+            raise RuntimeError(
+                "Reloading expert weights is not supported with "
+                "--enable-moe-locality-partition: the full-size weights were "
+                "released after sharding into the locality domains."
+            )
 
         # For flashinfer TRT-LLM BF16 path, process_weights_after_loading reshapes
         # expert weights into block layout. During weight update, we must restore

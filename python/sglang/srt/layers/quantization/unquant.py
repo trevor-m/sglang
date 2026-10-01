@@ -842,6 +842,14 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_weight.data = layer.w2_weight.data.reshape(
                 layer.num_local_experts, *new_shape_w2
             )
+
+            # --enable-moe-locality-partition: shard the block-layout weights into the
+            # locality domains and release the full-size copies.
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm_locality import (
+                partition_bf16_moe_weights_for_locality,
+            )
+
+            partition_bf16_moe_weights_for_locality(layer)
         if _is_npu:
             # The kernels set the dispatcher output dtype themselves -- they are
             # the ones that know what their gmms expect. NPUUnquantMoEMethod
@@ -1122,6 +1130,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
                 gemm2_weights=layer.w2_weight,
                 global_num_experts=layer.num_experts,
                 local_expert_offset=layer.moe_ep_rank * layer.num_local_experts,
+                locality_shards=layer.moe_locality_shards,
             )
             return self.runner.run(dispatch_output, quant_info)
         else:

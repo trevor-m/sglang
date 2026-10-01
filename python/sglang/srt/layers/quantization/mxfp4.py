@@ -926,6 +926,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 torch.stack(gemm2_bias_shuffled).reshape(E, -1),
                 requires_grad=False,
             )
+
+            # --enable-moe-locality-partition: shard the shuffled weights and
+            # interleaved scales into the locality domains.
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm_locality import (
+                partition_mxfp4_trtllm_gen_moe_weights_for_locality,
+            )
+
+            partition_mxfp4_trtllm_gen_moe_weights_for_locality(layer)
             return
         if _use_aiter:
             if getattr(layer, "w13_weight_bias", None) is not None:
@@ -1572,6 +1580,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             hidden_size=self.hidden_size,
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
             routing_bias=routing_bias,
+            locality_shards=layer.moe_locality_shards,
         )
         return self.runner.run(dispatch_output, quant_info)
 

@@ -633,6 +633,11 @@ class Resources(_FlagGroupBase):
     # (kind, subbatch) — see dp_attention._tbo_event for why reuse matters.
     tbo_event_pool: dict = msgspec.field(default_factory=dict)
     flashinfer_megamoe_workspaces: dict = msgspec.field(default_factory=dict)
+    # FlashInfer TRT-LLM MoE locality-domain partition: the process-wide
+    # localized pools, green-context streams and fork/join events shared by
+    # every partitioned MoE layer (owning accessor lives in
+    # layers.moe.moe_runner.flashinfer_trtllm_locality).
+    moe_locality_partition: Any = None
     # State capturers (installed by their subsystems when capture is on).
     indexer_capturer: Any = None
     experts_capturer: Any = None

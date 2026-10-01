@@ -1395,6 +1395,7 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                     self.moe_runner_config.activation,
                     is_gated=self.moe_runner_config.is_gated,
                 ),
+                locality_shards=layer.moe_locality_shards,
             )
 
             return fused_experts_none_to_flashinfer_trtllm_fp8(
@@ -3160,6 +3161,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 gemm1_alpha=gemm1_alpha.data if gemm1_alpha is not None else None,
                 gemm1_beta=gemm1_beta.data if gemm1_beta is not None else None,
                 gemm1_clamp_limit=gemm1_clamp.data if gemm1_clamp is not None else None,
+                locality_shards=layer.moe_locality_shards,
             )
 
             return self.runner.run(dispatch_output, quant_info)

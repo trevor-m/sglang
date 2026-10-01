@@ -78,6 +78,7 @@ def _trtllm_prepared_layer() -> SimpleNamespace:
         g1_scale_c=p(torch.full((NUM_EXPERTS,), 0.25, dtype=torch.float32)),
         g1_alphas=p(torch.full((NUM_EXPERTS,), 0.5, dtype=torch.float32)),
         g2_alphas=p(torch.full((NUM_EXPERTS,), 0.75, dtype=torch.float32)),
+        moe_locality_shards=None,
         w13_input_scale_quant=torch.tensor(2.0, dtype=torch.float32),
         num_experts=NUM_EXPERTS,
         num_local_experts=NUM_EXPERTS,

@@ -114,6 +114,9 @@ def handle_moe_kernel_config(server_args: Any):
             f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
         )
 
+    if cfg.enable_moe_locality_partition:
+        validate_moe_locality_partition(view)
+
     # The runner-driven shared-experts fusion disables moved to the
     # pipeline (arg_groups/overrides.py: _moe_runner_fusion_disable),
     # invoked here at the legacy write slots.
@@ -127,6 +130,54 @@ def handle_moe_kernel_config(server_args: Any):
     ]:
         assert resolved_view(server_args).ep_size == 1, (
             "FP8/MXFP8 Cutlass MoE is only supported with ep_size == 1"
+        )
+
+
+_MOE_LOCALITY_RUNNER_BACKENDS = (
+    "flashinfer_trtllm",
+    "flashinfer_trtllm_routed",
+    "flashinfer_mxfp4",
+)
+# Quantizations whose TRT-LLM-gen weight layout has a partitioned Prims-TS op.
+# DeepSeek 128x128 block FP8 ("fp8" checkpoints with a block size) is rejected
+# at weight-loading time, where the block shape is known.
+_MOE_LOCALITY_QUANTIZATIONS = (
+    "modelopt_fp4",
+    "nvfp4_online",
+    "fp8",
+    "mxfp8",
+    "mxfp4",
+    "modelopt_fp8",
+    "modelopt_mixed",
+    "compressed-tensors",
+    None,
+)
+
+
+def validate_moe_locality_partition(view: Any) -> None:
+    """--enable-moe-locality-partition only has a kernel behind these settings."""
+    if view.moe_runner_backend not in _MOE_LOCALITY_RUNNER_BACKENDS:
+        raise ValueError(
+            "--enable-moe-locality-partition requires --moe-runner-backend "
+            f"{' / '.join(_MOE_LOCALITY_RUNNER_BACKENDS)} (the FlashInfer "
+            f"TRT-LLM-gen weight layouts), got '{view.moe_runner_backend}'."
+        )
+    if view.moe_a2a_backend != "none":
+        raise ValueError(
+            "--enable-moe-locality-partition requires --moe-a2a-backend none, "
+            f"got '{view.moe_a2a_backend}'."
+        )
+    if view.quantization not in _MOE_LOCALITY_QUANTIZATIONS:
+        raise ValueError(
+            f"--enable-moe-locality-partition does not support quantization "
+            f"'{view.quantization}'; supported: "
+            f"{[q or 'bfloat16' for q in _MOE_LOCALITY_QUANTIZATIONS]}."
+        )
+    if view.enable_torch_compile:
+        raise ValueError(
+            "--enable-moe-locality-partition launches on green-context streams "
+            "from Python and cannot be traced by torch.compile; drop "
+            "--enable-torch-compile."
         )
 
 

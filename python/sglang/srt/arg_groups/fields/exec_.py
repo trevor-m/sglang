@@ -782,6 +782,29 @@ class ExecMoe(msgspec.Struct):
         "On SM90, `fp8` selects the Humming-style MXFP4-weight x FP8-activation "
         "path introduced by FlashInfer #3738 and requires FlashInfer >= 0.6.18.",
     ] = "default"
+    enable_moe_locality_partition: A[
+        bool,
+        "Partition every MoE layer's expert weights across the two GPU memory "
+        "locality domains (the two dies of a Rubin GPU) and run each half's GEMMs on a "
+        "green-context stream pinned to the SMs local to that domain, via "
+        "FlashInfer's Prims-TS partitioned MoE (tp_n_tp_n: FC1 and FC2 output rows "
+        "are sharded, FC2 writes disjoint hidden halves). Requires "
+        "--moe-runner-backend flashinfer_trtllm, flashinfer_trtllm_routed, or "
+        "flashinfer_mxfp4, --moe-a2a-backend none, a gated activation, a FlashInfer "
+        "build with flashinfer.locality_domain, CUDA 13.4, and a SM100/SM103/SM107 "
+        "GPU exposing two locality domains. In-place weight updates are not "
+        "supported while enabled.",
+    ] = False
+    moe_locality_sm_split: A[
+        Literal["backfill", "strict"],
+        Arg(
+            help="How --enable-moe-locality-partition splits SMs between the two "
+            "locality-domain green contexts. 'backfill' uses every SM, borrowing the "
+            "device's remainder SMs across domains; 'strict' uses only each domain's "
+            "local SMs and leaves the remainder idle.",
+            choices=["backfill", "strict"],
+        ),
+    ] = "backfill"
     deepep_mode: A[
         Literal["auto", "normal", "low_latency"],
         "Select the mode when enable DeepEP or MoriEP MoE, could be `normal`, `low_latency` or `auto`. Default is `auto`, which means `low_latency` for decode batch and `normal` for prefill batch.",

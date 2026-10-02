@@ -456,7 +456,7 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 run_locality_partitioned_mxfp4_routed_moe,
             )
 
-            output = run_locality_partitioned_mxfp4_routed_moe(
+            result = run_locality_partitioned_mxfp4_routed_moe(
                 shards=layer.moe_locality_shards,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
@@ -473,6 +473,10 @@ class Mxfp4FlashinferTrtllmMoEMethod:
                 defer_finalize=defer_finalize,
                 output=symm_output,
             )
+            if defer_finalize:
+                output = _make_deferred_finalize_output(result, top_k=topk_ids.shape[1])
+            else:
+                output = result
             return StandardCombineInput(hidden_states=output)
 
         result = trtllm_fp4_block_scale_routed_moe(

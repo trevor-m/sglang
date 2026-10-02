@@ -518,12 +518,14 @@ def _routed_ids_and_weights(
     return routing, None
 
 
-def _require_finalize(defer_finalize: bool, what: str) -> None:
+def _finish(result: Any, output: Optional[torch.Tensor], defer_finalize: bool) -> Any:
+    """Finalized: the caller's output buffer. Deferred: the unfinalized
+    ``[gemm2_output, expert_weights, expanded_idx_to_permuted_idx]`` triple, the
+    same ABI trtllm-gen returns for ``do_finalize=False``."""
     if defer_finalize:
-        raise NotImplementedError(
-            "--enable-moe-locality-partition: deferred finalize is not supported "
-            f"for the partitioned {what} MoE path"
-        )
+        return result
+    assert output is not None
+    return _unwrap_output(result, output)
 
 
 def run_locality_partitioned_fp4_moe(
@@ -538,15 +540,18 @@ def run_locality_partitioned_fp4_moe(
     hidden_states_scale: torch.Tensor,
     per_token_scale: Optional[torch.Tensor],
     activation_type: int,
-    output: torch.Tensor,
-) -> torch.Tensor:
-    """NVFP4 (ModelOpt / compressed-tensors) partitioned forward."""
+    output: Optional[torch.Tensor],
+) -> Any:
+    """NVFP4 (ModelOpt / compressed-tensors) partitioned forward.
+
+    With ``defer_finalize`` the unfinalized triple is returned for the caller's
+    fused finalize (see ``_finish``); ``output`` may then be ``None``.
+    """
     from flashinfer.fused_moe import prims_ts_fp4_block_scale_moe_partitioned
 
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    _require_finalize(defer_finalize, "FP4")
     if per_token_scale is not None:
         raise NotImplementedError(
             "--enable-moe-locality-partition: per-token NVFP4 activation scaling "
@@ -570,7 +575,7 @@ def run_locality_partitioned_fp4_moe(
         partition_resources=shards.resources,
         partition_strategy=shards.strategy,
         weight_layout=_WEIGHT_LAYOUT_MAJOR_K,
-        do_finalize=True,
+        do_finalize=not defer_finalize,
         enable_pdl=_enable_pdl(num_tokens),
         activation_type=activation_type,
         per_token_scale=None,
@@ -615,7 +620,7 @@ def run_locality_partitioned_fp4_moe(
             ),
         )
     result = prims_ts_fp4_block_scale_moe_partitioned(**kwargs)
-    return _unwrap_output(result, output)
+    return _finish(result, output, defer_finalize)
 
 
 def run_locality_partitioned_mxfp4_moe(
@@ -719,8 +724,8 @@ def run_locality_partitioned_mxfp4_routed_moe(
     local_expert_offset: int,
     local_num_experts: int,
     defer_finalize: bool,
-    output: torch.Tensor,
-) -> torch.Tensor:
+    output: Optional[torch.Tensor],
+) -> Any:
     """MXFP4-expert routed forward (``Mxfp4FlashinferTrtllmMoEMethod``).
 
     Mirrors that method's ``trtllm_fp4_block_scale_routed_moe`` call: unpacked
@@ -731,7 +736,6 @@ def run_locality_partitioned_mxfp4_routed_moe(
 
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    _require_finalize(defer_finalize, "MXFP4")
     num_tokens = hidden_states.shape[0]
     result = prims_ts_fp4_block_scale_moe_partitioned(
         routing_logits=None,
@@ -759,7 +763,7 @@ def run_locality_partitioned_mxfp4_routed_moe(
         routed_scaling_factor=1.0,
         routing_method_type=int(RoutingMethodType.TopK),
         weight_layout=_WEIGHT_LAYOUT_MAJOR_K,
-        do_finalize=True,
+        do_finalize=not defer_finalize,
         enable_pdl=_enable_pdl(num_tokens),
         output=output,
         tune_max_num_tokens=next_power_of_2(num_tokens),
@@ -767,7 +771,7 @@ def run_locality_partitioned_mxfp4_routed_moe(
         gemm1_beta=None,
         gemm1_clamp_limit=gemm1_clamp_limit,
     )
-    return _unwrap_output(result, output)
+    return _finish(result, output, defer_finalize)
 
 
 def run_locality_partitioned_fp8_moe(
@@ -780,9 +784,13 @@ def run_locality_partitioned_fp8_moe(
     defer_finalize: bool,
     hidden_states: torch.Tensor,
     hidden_states_scale: Optional[torch.Tensor],
-    output: torch.Tensor,
-) -> torch.Tensor:
-    """FP8 partitioned forward: MXFP8 block scales or per-tensor scales."""
+    output: Optional[torch.Tensor],
+) -> Any:
+    """FP8 partitioned forward: MXFP8 block scales or per-tensor scales.
+
+    Deferred finalize (unfinalized triple, ``output`` may be ``None``) is only
+    available on the block-scale path, as for the unpartitioned kernels.
+    """
     from flashinfer.fused_moe import (
         Fp8QuantizationType,
         prims_ts_fp8_block_scale_moe_partitioned,
@@ -792,7 +800,6 @@ def run_locality_partitioned_fp8_moe(
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.moe.utils import RoutingMethodType
 
-    _require_finalize(defer_finalize, "FP8")
     num_tokens = hidden_states.shape[0]
     routing_method_type = int(quant_info.routing_method_type)
 
@@ -839,7 +846,7 @@ def run_locality_partitioned_fp8_moe(
             if runner_config.routed_scaling_factor is not None
             else 1.0
         ),
-        do_finalize=True,
+        do_finalize=not defer_finalize,
         enable_pdl=_enable_pdl(num_tokens),
         tune_max_num_tokens=next_power_of_2(num_tokens),
         output=output,
@@ -869,11 +876,12 @@ def run_locality_partitioned_fp8_moe(
             **routing_kwargs,
             **common,
         )
-        return _unwrap_output(result, output)
+        return _finish(result, output, defer_finalize)
 
-    if use_routed_topk:
+    if use_routed_topk or defer_finalize:
         raise NotImplementedError(
-            "--enable-moe-locality-partition: per-tensor FP8 requires logits routing"
+            "--enable-moe-locality-partition: per-tensor FP8 requires logits "
+            "routing and a finalized output"
         )
     routing_kwargs["routing_logits"] = routing_kwargs["routing_logits"].to(
         torch.bfloat16

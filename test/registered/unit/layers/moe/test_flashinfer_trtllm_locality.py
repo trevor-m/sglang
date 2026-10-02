@@ -168,7 +168,15 @@ class _FakeFlashInfer:
 
         def partitioned_op(**kwargs):
             self.partitioned_calls.append(kwargs)
-            return [kwargs["output"]]
+            if kwargs["do_finalize"]:
+                return [kwargs["output"]]
+            # Unfinalized ABI: permuted GEMM2 output, routing weights, indices.
+            num_tokens = kwargs["hidden_states"].shape[0]
+            return [
+                torch.zeros(num_tokens * kwargs["top_k"], HIDDEN, dtype=torch.bfloat16),
+                torch.ones(num_tokens, kwargs["top_k"], dtype=torch.bfloat16),
+                torch.zeros(num_tokens, kwargs["top_k"], dtype=torch.int32),
+            ]
 
         fused_moe.prims_ts_fp4_block_scale_moe_partitioned = partitioned_op
 
@@ -468,9 +476,18 @@ class TestMoeLocalityPartitionedForward(_LocalityTestCase):
         self.assertEqual(call["top_k"], 2)
         self.assertIsNone(call["topk_ids"])
 
-    def test_fp4_forward_refuses_deferred_finalize_and_per_token_scale(self):
-        with self.assertRaises(NotImplementedError):
-            self._run(defer_finalize=True)
+    def test_fp4_deferred_finalize_returns_the_unfinalized_triple(self):
+        """DeepSeek-style fused finalize (shared-expert add) runs the MoE with
+        do_finalize=False and consumes trtllm-gen's triple unchanged."""
+        _, _, result = self._run(defer_finalize=True)
+
+        (call,) = self.fi.partitioned_calls
+        self.assertFalse(call["do_finalize"])
+        self.assertEqual(len(result), 3)
+        self.assertEqual(result[0].dtype, torch.bfloat16)
+        self.assertEqual(result[2].dtype, torch.int32)
+
+    def test_fp4_forward_refuses_per_token_scale(self):
         with self.assertRaises(NotImplementedError):
             self._run(per_token_scale=torch.ones(3))
         self.assertEqual(self.fi.partitioned_calls, [])

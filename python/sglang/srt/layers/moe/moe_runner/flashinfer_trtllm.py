@@ -861,8 +861,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
                 defer_finalize=defer_finalize,
                 hidden_states=a_q,
                 hidden_states_scale=a_sf_t,
-                output=cast(torch.Tensor, symm_output),
+                output=symm_output,
             )
+            if defer_finalize:
+                output = _make_deferred_finalize_output(
+                    output, top_k=topk_output.topk_config.top_k
+                )
             return StandardCombineInput(hidden_states=output)
 
         # Move kernel call outside context manager to avoid graph breaks
@@ -1494,8 +1498,12 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             hidden_states_scale=hs_scale,
             per_token_scale=per_token_scale,
             activation_type=activation_type,
-            output=cast(torch.Tensor, symm_output),
+            output=symm_output,
         )
+        if defer_finalize:
+            result = _make_deferred_finalize_output(
+                result, top_k=topk_output.topk_config.top_k
+            )
         return StandardCombineInput(hidden_states=result)
 
     if use_routed_topk:

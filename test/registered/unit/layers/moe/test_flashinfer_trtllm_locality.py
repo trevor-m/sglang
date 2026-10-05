@@ -37,7 +37,8 @@ from sglang.test.test_utils import CustomTestCase
 
 NUM_EXPERTS = 4
 HIDDEN = 256
-INTERMEDIATE = 128
+# MXFP4 (group 32) shards need I % 256 == 0; NVFP4 (group 16) needs I % 128.
+INTERMEDIATE = 256
 PARTITION_COUNT = 2
 
 
@@ -194,29 +195,31 @@ def _param(tensor):
     return torch.nn.Parameter(tensor, requires_grad=False)
 
 
-def _nvfp4_trtllm_layer(*, activation="silu", is_gated=True):
+def _nvfp4_trtllm_layer(
+    *, activation="silu", is_gated=True, intermediate=INTERMEDIATE
+):
     """A layer as align_fp4_moe_weights_for_flashinfer_trtllm leaves it."""
     return SimpleNamespace(
         moe_runner_config=MoeRunnerConfig(activation=activation, is_gated=is_gated),
         moe_locality_shards=None,
         w13_weight=_param(
             torch.randint(
-                0, 255, (NUM_EXPERTS, 2 * INTERMEDIATE, HIDDEN // 2), dtype=torch.uint8
+                0, 255, (NUM_EXPERTS, 2 * intermediate, HIDDEN // 2), dtype=torch.uint8
             )
         ),
         w2_weight=_param(
             torch.randint(
-                0, 255, (NUM_EXPERTS, HIDDEN, INTERMEDIATE // 2), dtype=torch.uint8
+                0, 255, (NUM_EXPERTS, HIDDEN, intermediate // 2), dtype=torch.uint8
             )
         ),
         w13_weight_scale=_param(
             torch.randint(
-                0, 255, (NUM_EXPERTS, 2 * INTERMEDIATE, HIDDEN // 16), dtype=torch.uint8
+                0, 255, (NUM_EXPERTS, 2 * intermediate, HIDDEN // 16), dtype=torch.uint8
             ).view(torch.float8_e4m3fn)
         ),
         w2_weight_scale=_param(
             torch.randint(
-                0, 255, (NUM_EXPERTS, HIDDEN, INTERMEDIATE // 16), dtype=torch.uint8
+                0, 255, (NUM_EXPERTS, HIDDEN, intermediate // 16), dtype=torch.uint8
             ).view(torch.float8_e4m3fn)
         ),
     )
@@ -249,7 +252,12 @@ class TestMoeLocalityWeightSharding(_LocalityTestCase):
         before = layer.w13_weight.data
         locality.partition_fp4_moe_weights_for_locality(layer, scale_k_group_size=16)
         self.assertIsNone(layer.moe_locality_shards)
-        self.assertIs(layer.w13_weight.data, before)
+        # ``Parameter.data`` is a fresh alias on every access; compare storage.
+        after = layer.w13_weight.data
+        self.assertEqual(after.data_ptr(), before.data_ptr())
+        self.assertEqual(
+            after.untyped_storage().nbytes(), before.untyped_storage().nbytes()
+        )
 
     def test_fp4_shards_land_in_their_domain_and_full_weights_are_released(self):
         layer = _nvfp4_trtllm_layer()
@@ -394,6 +402,48 @@ class TestMoeLocalityWeightSharding(_LocalityTestCase):
         with self.assertRaises(NotImplementedError):
             locality.reject_deepseek_fp8_block_locality_partition()
         self.assertEqual(self.fi.get_localized_domains.call_count, 1)
+
+    def test_partitioned_op_is_excluded_from_startup_autotune(self):
+        """Profiling the partitioned op's ~1000 Prims-TS tactics at startup took
+        hours (one CuTe-DSL compile per tactic); the flag must imply the skip."""
+        from sglang.srt.model_executor.runner.flashinfer_autotune import (
+            get_flashinfer_autotune_skip_ops,
+        )
+
+        self.assertIn(
+            "flashinfer::prims_ts_fp4_block_scale_moe_partitioned",
+            get_flashinfer_autotune_skip_ops(None),
+        )
+        self._config.restore()
+        self._config = get_context().override_server_args(
+            enable_moe_locality_partition=False,
+            moe_runner_backend="flashinfer_trtllm",
+        )
+        self._config.install()
+        self.assertNotIn(
+            "flashinfer::prims_ts_fp4_block_scale_moe_partitioned",
+            get_flashinfer_autotune_skip_ops(None),
+        )
+
+    def test_fp4_intermediate_must_cover_whole_scale_groups(self):
+        """TP-sharded experts whose I/2 is not a multiple of 4 scale blocks (I=1152
+        for DeepSeek-V4.1-Flash at TP2) would pass sharding and then fail at the
+        first forward with "No Prims-TS tactics support partition strategy"."""
+        for intermediate, group in ((128, 32), (192, 16)):
+            layer = _nvfp4_trtllm_layer(intermediate=intermediate)
+            with self.assertRaisesRegex(NotImplementedError, "ep-size"):
+                locality.partition_fp4_moe_weights_for_locality(
+                    layer, scale_k_group_size=group
+                )
+            self.assertIsNone(layer.moe_locality_shards)
+        self.fi.get_localized_domains.assert_not_called()
+        # The aligned sizes are accepted: 128 for group 16, 256 for group 32.
+        locality.partition_fp4_moe_weights_for_locality(
+            _nvfp4_trtllm_layer(intermediate=128), scale_k_group_size=16
+        )
+        locality.partition_fp4_moe_weights_for_locality(
+            _nvfp4_trtllm_layer(intermediate=256), scale_k_group_size=32
+        )
 
 
 class TestMoeLocalityPartitionedForward(_LocalityTestCase):

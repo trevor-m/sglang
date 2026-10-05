@@ -50,6 +50,12 @@ FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS = frozenset()
 def get_flashinfer_autotune_skip_ops(model_runner: ModelRunner) -> set[str]:
     skip_ops = set(get_exec().kernel.flashinfer_autotune_skip_ops or ())
     skip_ops.update(FLASHINFER_AUTOTUNE_WORKAROUND_SKIPS)
+    if get_exec().moe.enable_moe_locality_partition:
+        from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm_locality import (
+            MOE_LOCALITY_AUTOTUNE_SKIP_OPS,
+        )
+
+        skip_ops.update(MOE_LOCALITY_AUTOTUNE_SKIP_OPS)
     return skip_ops
 
 

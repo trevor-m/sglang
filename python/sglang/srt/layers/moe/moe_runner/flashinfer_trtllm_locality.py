@@ -58,6 +58,13 @@ _WEIGHT_LAYOUT_BLOCK_MAJOR_K = 2
 
 _PARTITION_COUNT = 2
 
+# Autotuner names of the partitioned ops. Each exposes ~1000 Prims-TS tactics and
+# every profiled tactic is a CuTe-DSL compile, so tuning takes hours per shape;
+# startup autotune skips them (default tactic) until FlashInfer prunes the space.
+MOE_LOCALITY_AUTOTUNE_SKIP_OPS = frozenset(
+    {"flashinfer::prims_ts_fp4_block_scale_moe_partitioned"}
+)
+
 _REQUIRED_FLASHINFER_HINT = (
     "--enable-moe-locality-partition requires a FlashInfer build with Prims-TS "
     "MoE localization (flashinfer.locality_domain and "
@@ -180,7 +187,7 @@ def get_moe_locality_partition(
         if isinstance(device, int)
         else torch.device(device)
     )
-    if resolved.index is None:
+    if resolved.type == "cuda" and resolved.index is None:
         resolved = torch.device("cuda", torch.cuda.current_device())
 
     resources = get_resources()
@@ -339,6 +346,22 @@ def _release_and_record(
 _FP4_SCALE_ATTRS = ("w13_weight_scale", "w2_weight_scale")
 
 
+def _require_fp4_intermediate_alignment(
+    intermediate_size: int, scale_k_group_size: int
+) -> None:
+    # FlashInfer's partitioned FC1 writes each shard's block-scaled output at
+    # offset I/2, which must cover whole 4-block scale-factor groups; otherwise
+    # every Prims-TS tactic is rejected at the first forward, not at load.
+    alignment = 8 * scale_k_group_size
+    if intermediate_size % alignment:
+        raise NotImplementedError(
+            "--enable-moe-locality-partition: FlashInfer's partitioned FP4 MoE "
+            f"needs a per-rank intermediate size that is a multiple of {alignment}, "
+            f"got {intermediate_size}. Keep experts unsharded across TP ranks by "
+            "setting --ep-size equal to --tp-size."
+        )
+
+
 def partition_fp4_moe_weights_for_locality(
     layer: Module,
     *,
@@ -361,12 +384,14 @@ def partition_fp4_moe_weights_for_locality(
             "FP4 locality partitioning expects packed uint8 weights, got "
             f"{w13_weight.dtype} / {w2_weight.dtype}"
         )
+    intermediate_size = int(w2_weight.shape[2]) * 2
+    _require_fp4_intermediate_alignment(intermediate_size, scale_k_group_size)
     w13_scale_attr, w2_scale_attr = scale_attrs
     shards = shard_prepared_moe_weights_for_locality(
         fc1_weight=w13_weight,
         fc2_weight=w2_weight,
         hidden_size=int(w2_weight.shape[1]),
-        intermediate_size=int(w2_weight.shape[2]) * 2,
+        intermediate_size=intermediate_size,
         weight_layout=_WEIGHT_LAYOUT_MAJOR_K,
         fc1_scale=getattr(layer, w13_scale_attr).data.view(torch.float8_e4m3fn),
         fc2_scale=getattr(layer, w2_scale_attr).data.view(torch.float8_e4m3fn),

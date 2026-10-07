@@ -97,10 +97,17 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
-    # DeepGEMM keeps one scale row per token and needs 16-byte TMA alignment
-    # on it (layout/mega_moe.cuh), so both dims must be multiples of 16 * group.
-    scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 16 * scale_group
+    if mma_type == "fp8xfp4":
+        # DeepGEMM's fp8_fp4 MegaMoE keeps activation scales MN-major and only
+        # asserts 128-element alignment (csrc/apis/mega_moe.hpp); vLLM gates the
+        # same kernel at 128. DeepSeek-V4.1-Flash (moe_intermediate_size 2304)
+        # needs this.
+        align = 128
+    else:
+        # DeepGEMM keeps one scale row per token and needs 16-byte TMA alignment
+        # on it (layout/mega_moe.cuh), so both dims must be multiples of 16 * group.
+        scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
+        align = 16 * scale_group
     if hidden % align != 0 or intermediate % align != 0:
         raise ValueError(
             f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size and "

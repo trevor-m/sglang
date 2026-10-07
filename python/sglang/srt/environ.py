@@ -1631,6 +1631,10 @@ class Envs:
     SGLANG_OPT_USE_AITER_BATCHED_GEMM = EnvBool(False)
     SGLANG_OPT_BF16_FP32_GEMM_ALGO = EnvStr("cublas")
     SGLANG_OPT_FUSE_WQA_WKV = EnvBool(True)
+    # SM107: run wq_b, the per-head RMSNorm (models with q_head_norm), RoPE and
+    # the FP8 Q cast as one CuTe DSL kernel. Takes effect only with
+    # --dsv4-attn-backend trtllm, whose attention consumes FP8 Q.
+    SGLANG_OPT_DSV4_FUSED_Q_B_SM107 = EnvBool(False)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

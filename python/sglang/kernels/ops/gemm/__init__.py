@@ -435,6 +435,23 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.dsv4_q_b_gemm_fused",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.dsv4_q_b_sm107:dsv4_q_b_gemm_fused",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 7), max_sm=(10, 7))}
+        ),
+        format_signature=FormatSignature(
+            supported_dtypes=("float8_e4m3fn",),
+            description=(
+                "DeepSeek-V4 q_b: MXFP8 GEMM + per-head RMSNorm + RoPE + E4M3 quant"
+            ),
+        ),
+        description="DeepSeek-V4 fused q_b projection (CuTe DSL, SM107).",
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.hopper_bf16_gemv",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.hopper_bf16_gemv:hopper_bf16_gemv",

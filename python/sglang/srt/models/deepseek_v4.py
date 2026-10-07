@@ -163,6 +163,11 @@ from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
     apply_mhc_post_pre_boundary,
     is_cross_layer_mhc_fusion_enabled,
 )
+from sglang.srt.models.deepseek_common.dsv4_fused_q_b import (
+    fused_q_b_forward,
+    fused_q_b_supported,
+    prepare_fused_q_b,
+)
 from sglang.srt.models.deepseek_common.utils import (
     _use_aiter_bpreshuffle_gfx95,
     is_wint4afp8_or_wint4a16_config,
@@ -1068,6 +1073,7 @@ class MqaAttentionBase(nn.Module):
 
 class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
+    fused_q_b_weight_scale: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -1217,6 +1223,14 @@ class MQALayer(MqaAttentionBase):
             and self.wo_a.weight.shape == (self.n_local_groups * self.o_lora_rank, 4096)
             and (self.n_local_groups, self.o_lora_rank) == (2, 1024)
         )
+        # Static eligibility; prepare_fused_q_b builds the weight scale after
+        # loading and leaves it None when wq_b has no MXFP8 view.
+        self.use_fused_q_b = fused_q_b_supported(
+            head_dim=self.head_dim,
+            rope_head_dim=self.qk_rope_head_dim,
+            q_lora_rank=self.q_lora_rank,
+        )
+        self.fused_q_b_weight_scale: Optional[torch.Tensor] = None
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
 
@@ -1230,6 +1244,14 @@ class MQALayer(MqaAttentionBase):
             self.indexer.compressor.fp4_cos = self.cos_cache[:, 0, 0, :]
             self.indexer.compressor.fp4_sin = self.sin_cache[:, 0, 0, :]
         return result
+
+    def prepare_fused_q_b(self) -> None:
+        """Build the fused q_b weight scale and compile its kernel; runs after the
+        quant method has processed wq_b and before CUDA graph capture."""
+        if self.use_fused_q_b:
+            self.fused_q_b_weight_scale = prepare_fused_q_b(
+                self.wq_b, apply_norm=self.q_head_norm, layer_id=self.layer_id
+            )
 
     def _get_npu_rope_position_cache(
         self,
@@ -1339,6 +1361,20 @@ class MQALayer(MqaAttentionBase):
         positions: torch.Tensor,
         q_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            self.fused_q_b_weight_scale is not None
+            and q_out is not None
+            and q_out.dtype == torch.float8_e4m3fn
+        ):
+            return fused_q_b_forward(
+                q,
+                weight=self.wq_b.weight,
+                weight_scale=self.fused_q_b_weight_scale,
+                freqs_cis=self.freqs_cis,
+                positions=positions,
+                eps=self.eps if self.q_head_norm else None,
+                q_out=q_out,
+            )
         q, _ = self.wq_b(q)
         q = q.view(-1, self.n_local_heads, self.head_dim)
         if not self.q_head_norm:
@@ -2260,8 +2296,11 @@ class MQALayer(MqaAttentionBase):
         tp_slice, q_padded, q_out, q_rope = slice(None), None, None, None
         k_nope, k_rope = None, None
         if (
-            self.is_dsv41
-            and not self.q_head_norm
+            (
+                (self.is_dsv41 and not self.q_head_norm)
+                # The fused q_b kernel emits FP8 Q, so q_head_norm models take it too.
+                or self.fused_q_b_weight_scale is not None
+            )
             and get_token_to_kv_pool().uniform_fp8
             and self.n_local_heads in (8, 16, 32, 64, 128)
         ):
@@ -2426,8 +2465,10 @@ class MQALayer(MqaAttentionBase):
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
             if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+                # Q may be FP8; the attention output is always in x's dtype.
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
+                    dtype=x.dtype,
                 )
                 bcg_deepseek_v4_attention_with_output(
                     attn_q,
@@ -4802,6 +4843,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                 module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
+            elif isinstance(module, MQALayer):
+                module.prepare_fused_q_b()
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(

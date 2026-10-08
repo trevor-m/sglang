@@ -1230,6 +1230,9 @@ class MQALayer(MqaAttentionBase):
             rope_head_dim=self.qk_rope_head_dim,
             q_lora_rank=self.q_lora_rank,
         )
+        self.fused_q_b_min_tokens = (
+            envs.SGLANG_OPT_DSV4_FUSED_Q_B_SM107_MIN_TOKENS.get()
+        )
         self.fused_q_b_weight_scale: Optional[torch.Tensor] = None
         if _is_hip:
             _hip.init_mqa_layer(self, quant_config)
@@ -1365,6 +1368,7 @@ class MQALayer(MqaAttentionBase):
             self.fused_q_b_weight_scale is not None
             and q_out is not None
             and q_out.dtype == torch.float8_e4m3fn
+            and q_out.shape[0] >= self.fused_q_b_min_tokens
         ):
             return fused_q_b_forward(
                 q,

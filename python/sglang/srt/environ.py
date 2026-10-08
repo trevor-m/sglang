@@ -1635,6 +1635,11 @@ class Envs:
     # the FP8 Q cast as one CuTe DSL kernel. Takes effect only with
     # --dsv4-attn-backend trtllm, whose attention consumes FP8 Q.
     SGLANG_OPT_DSV4_FUSED_Q_B_SM107 = EnvBool(False)
+    # Smallest token count that takes the fused kernel. 192 was neutral or
+    # faster on V4.1-Flash TP4 with the 4x2 launch, which ran up to ~2x slower
+    # below 128 KiB of FP8 activation; small batches now launch 2x1, so re-tune
+    # with test/manual/kernels/bench_dsv4_q_b_sm107.py.
+    SGLANG_OPT_DSV4_FUSED_Q_B_SM107_MIN_TOKENS = EnvInt(192)
     SGLANG_OPT_USE_MULTI_STREAM_OVERLAP = EnvBool(True)
 
     # ===================================================================

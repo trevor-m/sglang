@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.attention.deepseek_v4_rope import precompute_freqs_cis
 from sglang.kernels.ops.gemm.dsv4_q_b_sm107 import (
+    LAUNCH_CONFIGS,
     dsv4_q_b_gemm_fused,
     is_dsv4_q_b_fused_available,
 )
@@ -138,6 +139,31 @@ def test_matches_reference(model, m, quantizer, pos_dtype):
     out = dsv4_q_b_gemm_fused(a_q, a_sf, w_q, w_sf, freqs_cis, positions, eps=eps)
     torch.cuda.synchronize()
     _assert_close(out, _reference(a, w, freqs_cis, positions, eps))
+
+
+@pytest.mark.parametrize("model", list(MODELS))
+@pytest.mark.parametrize("launch_config", list(LAUNCH_CONFIGS))
+def test_every_launch_config_matches_reference(model, launch_config):
+    k, block, eps = MODELS[model]
+    w_q, w_sf, w = _weight(k, block)
+    freqs_cis = precompute_freqs_cis(64, MAX_POSITION, 0, 10000, 1.0, 32, 1).to(DEVICE)
+    # One partial M tile, and several that leave the last cluster partly empty.
+    for m in (5, 333):
+        torch.manual_seed(m)
+        a_q, a_sf, a = _activation(m, k, "torch")
+        positions = torch.randint(0, MAX_POSITION, (m,), device=DEVICE)
+        out = dsv4_q_b_gemm_fused(
+            a_q,
+            a_sf,
+            w_q,
+            w_sf,
+            freqs_cis,
+            positions,
+            eps=eps,
+            launch_config=launch_config,
+        )
+        torch.cuda.synchronize()
+        _assert_close(out, _reference(a, w, freqs_cis, positions, eps))
 
 
 @pytest.mark.parametrize("model", list(MODELS))

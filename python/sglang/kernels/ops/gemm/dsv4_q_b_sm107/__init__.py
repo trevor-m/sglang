@@ -14,10 +14,20 @@ from typing import Optional
 
 import torch
 
-# TRT-LLM's production launch for this kernel (cute_dsl_custom_ops.py).
-_MMA_INST_TILE = (256, 256)
-_CLUSTER_SHAPE_MN = (4, 2)
-_FALLBACK_CLUSTER_SHAPE_MN = (2, 1)
+# name -> (mma_inst_tile, cluster_shape_mn, fallback_cluster_shape_mn). The first
+# three are TRT-LLM's q_b autotuner candidates (user/lizhiz/rubin-dsv4-latest);
+# 2cta_4x2 is the fixed launch of its main-branch custom op.
+LAUNCH_CONFIGS = {
+    "1cta_1x1": ((128, 256), (1, 1), None),
+    "2cta_2x1": ((256, 256), (2, 1), None),
+    "2cta_2x2": ((256, 256), (2, 2), (2, 1)),
+    "2cta_4x2": ((256, 256), (4, 2), (2, 1)),
+}
+# (max tokens, launch config); the first bound that holds wins and the last entry
+# (bound None) takes everything larger. Measured on V4.1-Flash: 4x2 runs up to
+# ~2x slower than 2x1 while the activation is under 128 KiB, and 2x1 is ~10%
+# slower at 16k tokens. Re-tune with test/manual/kernels/bench_dsv4_q_b_sm107.py.
+_DEFAULT_LAUNCH_BY_TOKENS = ((256, "2cta_2x1"), (None, "2cta_4x2"))
 
 HEAD_DIM = 512
 # Floats per position row of torch.view_as_real(freqs_cis): 32 (cos, sin) pairs.
@@ -36,13 +46,25 @@ def is_dsv4_q_b_fused_available() -> bool:
     return True
 
 
-def _compiled_kernel(*, apply_norm: bool, positions_int64: bool):
+def _default_launch_config(num_tokens: int) -> str:
+    for max_tokens, launch_config in _DEFAULT_LAUNCH_BY_TOKENS[:-1]:
+        if num_tokens <= max_tokens:
+            return launch_config
+    return _DEFAULT_LAUNCH_BY_TOKENS[-1][1]
+
+
+@functools.cache
+def _compiled_kernel(*, launch_config: str, apply_norm: bool, positions_int64: bool):
+    # Cached here: kernel.compile builds the kernel object before its own cache lookup.
     from .kernel import compile as compile_kernel
 
+    mma_inst_tile, cluster_shape_mn, fallback_cluster_shape_mn = LAUNCH_CONFIGS[
+        launch_config
+    ]
     return compile_kernel(
-        mma_inst_tile=_MMA_INST_TILE,
-        cluster_shape_mn=_CLUSTER_SHAPE_MN,
-        fallback_cluster_shape_mn=_FALLBACK_CLUSTER_SHAPE_MN,
+        mma_inst_tile=mma_inst_tile,
+        cluster_shape_mn=cluster_shape_mn,
+        fallback_cluster_shape_mn=fallback_cluster_shape_mn,
         store_mode="stg256",
         swizzle_size=1,
         raster_along_m=True,
@@ -65,10 +87,14 @@ def precompile_dsv4_q_b_fused(
     apply_norm: bool,
     positions_dtype: torch.dtype = torch.int64,
 ) -> None:
-    """Compile the kernel and allocate its constants before CUDA graph capture."""
-    _compiled_kernel(
-        apply_norm=apply_norm, positions_int64=positions_dtype == torch.int64
-    )
+    """Compile the default launch configs and allocate the kernel's constants
+    before CUDA graph capture."""
+    for _, launch_config in _DEFAULT_LAUNCH_BY_TOKENS:
+        _compiled_kernel(
+            launch_config=launch_config,
+            apply_norm=apply_norm,
+            positions_int64=positions_dtype == torch.int64,
+        )
     device = torch.device(device)
     _unit_quant_scale(
         torch.cuda.current_device() if device.index is None else device.index
@@ -85,6 +111,7 @@ def dsv4_q_b_gemm_fused(
     *,
     eps: Optional[float],
     out: Optional[torch.Tensor] = None,
+    launch_config: Optional[str] = None,
 ) -> torch.Tensor:
     """``out[m, h*512:(h+1)*512] = e4m3(rope(rmsnorm(a[m] @ weight[h*512:(h+1)*512].T)))``.
 
@@ -98,6 +125,7 @@ def dsv4_q_b_gemm_fused(
     positions: [>= M] int32 or int64; the first M are used.
     eps: RMSNorm epsilon over each 512-wide head (no weight), or None to skip it.
     out: optional [M, N] float8_e4m3fn contiguous output.
+    launch_config: a ``LAUNCH_CONFIGS`` key; None picks one by token count.
     """
     import cuda.bindings.driver as cuda_driver
     from cutlass.cute.runtime import from_dlpack
@@ -134,10 +162,17 @@ def dsv4_q_b_gemm_fused(
         raise ValueError(f"out must be a [{m}, {n}] float8_e4m3fn tensor")
     elif not out.is_contiguous():
         raise ValueError("out must be contiguous")
+    if launch_config is None:
+        launch_config = _default_launch_config(m)
+    elif launch_config not in LAUNCH_CONFIGS:
+        raise ValueError(
+            f"unknown launch_config {launch_config!r}; one of {list(LAUNCH_CONFIGS)}"
+        )
     if m == 0:
         return out
 
     compiled = _compiled_kernel(
+        launch_config=launch_config,
         apply_norm=eps is not None,
         positions_int64=positions.dtype == torch.int64,
     )
@@ -163,6 +198,7 @@ def dsv4_q_b_gemm_fused(
 
 __all__ = [
     "COS_SIN_ROW_FLOATS",
+    "LAUNCH_CONFIGS",
     "dsv4_q_b_gemm_fused",
     "is_dsv4_q_b_fused_available",
     "precompile_dsv4_q_b_fused",

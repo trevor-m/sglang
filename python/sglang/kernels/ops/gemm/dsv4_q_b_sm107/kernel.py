@@ -36,7 +36,9 @@
 # - the cos/sin row stride is a parameter (64 floats for SGLang's
 #   view_as_real(freqs_cis), 128 for the TRT-LLM cache);
 # - apply_norm=False skips the per-head RMSNorm (DeepSeek-V4.1, q_head_norm=False);
-# - iket profiling ranges are optional.
+# - iket profiling ranges are optional;
+# - the tma_tile sub-tile A descriptor for small M is ported from the kernel's
+#   source tree (gemm_norm_rope_fusion @ 4a7bbdd, Caleb Du), which TRT-LLM lacks.
 
 """CuTe-DSL-style SM107 persistent MXFP8 q_b GEMM fused with RMSNorm,
 RoPE and E4M3 quant -- standalone, mixed-cluster capable.
@@ -305,6 +307,7 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         cos_sin_row_floats: int = DEFAULT_COS_SIN_ROW_FLOATS,
         tma_prefetch_dist: int = 0,
         enable_pdl: bool = True,
+        tma_tile: Tuple[int, int, int] | None = None,
     ):
         self.apply_norm = bool(apply_norm)
         if int(tma_prefetch_dist) < 0:
@@ -340,6 +343,23 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
                     "fallback cluster must divide the preferred shape per "
                     "dimension and be strictly smaller"
                 )
+
+        # Sub-tile A descriptor for small M: the A TMA box shrinks to tma_tile[0]
+        # rows, so a launch with M <= tma_tile[0] never moves the 128-row box's
+        # out-of-bounds rows. Rows past it in the SMEM stage stay garbage, which is
+        # harmless: GEMM rows are independent and the epilogue is row-predicated.
+        self.tma_tiler: Optional[Tuple[int, int, int]] = None
+        if tma_tile is not None and tuple(tma_tile) != tuple(self.mma_tiler):
+            tt = tuple(tma_tile)
+            if self.use_2cta_instrs:
+                raise ValueError("tma_tile requires the 1-CTA MMA")
+            if self.cluster_shape_mn != (1, 1):
+                raise ValueError("tma_tile requires cluster_shape_mn (1, 1)")
+            if tt[1:] != tuple(self.mma_tiler[1:]):
+                raise ValueError("tma_tile may only shrink the m extent")
+            if tt[0] & (tt[0] - 1) or not 1 <= tt[0] <= self.mma_tiler[0]:
+                raise ValueError("tma_tile m must be a power of two <= the mma tile m")
+            self.tma_tiler = tt
 
         if int(swizzle_size) < 1:
             raise ValueError("swizzle_size must be >= 1")
@@ -535,9 +555,22 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
                 flush=True,
             )
 
-        self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
+        self.full_a_smem_layout_staged = sm100_utils.make_smem_layout_a(
             tiled_mma_akeep, self.mma_tiler, self.a_dtype, self.num_ab_stage
         )
+        self.a_smem_layout_staged = self.full_a_smem_layout_staged
+        if self.tma_tiler is not None:
+            # The TMA view aliases the first tma_tiler[0] rows of each stock stage
+            # (same swizzle; 128 K-bytes per row, 16384 B per 128-row stage);
+            # make_smem_layout_a would round the tiler back up to the 128-row atom.
+            self.a_smem_layout_staged = cute.make_composed_layout(
+                self.full_a_smem_layout_staged.inner,
+                0,
+                cute.make_layout(
+                    (self.tma_tiler[0], (64, 2), 1, self.num_ab_stage),
+                    stride=(128, (1, 64), 0, 16384),
+                ),
+            )
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             tiled_mma_akeep, self.mma_tiler, self.b_dtype, self.num_ab_stage
         )
@@ -750,7 +783,7 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
             tmem_holding_buf: cutlass.Int32
             sA: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.a_dtype, cute.cosize(self.a_smem_layout_staged.outer)
+                    self.a_dtype, cute.cosize(self.full_a_smem_layout_staged.outer)
                 ],
                 self.buffer_align_bytes,
             ]
@@ -839,16 +872,27 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         sfb_smem_layout = cute.slice_(
             self.sfb_smem_layout_staged, (None, None, None, 0)
         )
-        tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
-            sm100_utils.cluster_shape_to_tma_atom_A(
-                cluster_shape_mn, tiled_mma_akeep.thr_id
-            ),
-            a_tensor,
-            a_smem_layout,
-            self.mma_tiler,
-            tiled_mma_akeep,
-            vmnk.shape,
-        )
+        if cutlass.const_expr(self.tma_tiler is not None):
+            # The MMA-integrated builder rejects boxes below the atom's 128 rows.
+            tma_atom_a, tma_tensor_a = cpasync.make_tiled_tma_atom(
+                sm100_utils.cluster_shape_to_tma_atom_A(
+                    cluster_shape_mn, tiled_mma_akeep.thr_id
+                ),
+                a_tensor,
+                a_smem_layout,
+                (self.tma_tiler[0], self.tma_tiler[2], 1),
+            )
+        else:
+            tma_atom_a, tma_tensor_a = cute.nvgpu.make_tiled_tma_atom_A(
+                sm100_utils.cluster_shape_to_tma_atom_A(
+                    cluster_shape_mn, tiled_mma_akeep.thr_id
+                ),
+                a_tensor,
+                a_smem_layout,
+                self.mma_tiler,
+                tiled_mma_akeep,
+                vmnk.shape,
+            )
         tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
             sm100_utils.cluster_shape_to_tma_atom_B(
                 cluster_shape_mn, tiled_mma_akeep.thr_id
@@ -1105,9 +1149,13 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         )
         pipeline_init_arrive(cluster_shape_mn=launch_cluster_shape_mn, is_relaxed=True)
 
+        # The MMA always reads the full 128-row stage, even under a sub-tile TMA box.
+        a_mma_smem_layout_staged = sm100_utils.make_smem_layout_a(
+            tiled_mma_akeep, self.mma_tiler, self.a_dtype, self.num_ab_stage
+        )
         sA = storage.sA.get_tensor(
-            self.a_smem_layout_staged.outer,
-            swizzle=self.a_smem_layout_staged.inner,
+            a_mma_smem_layout_staged.outer,
+            swizzle=a_mma_smem_layout_staged.inner,
         )
         sB = storage.sB.get_tensor(
             self.b_smem_layout_staged.outer,
@@ -1160,13 +1208,33 @@ class CuteBlockScaledGemmFusedRMSNormRopeQuant:
         a_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
         )
-        tAsA, tAgA = cpasync.tma_partition(
-            tma_atom_a,
-            block_in_cluster_coord_vmnk[2],
-            a_cta_layout,
-            cute.group_modes(sA, 0, 3),
-            cute.group_modes(tCgA, 0, 3),
-        )
+        if cutlass.const_expr(self.tma_tiler is not None):
+            # tAgA tiles M by tma_tiler[0] rows, so this handle only serves
+            # M <= tma_tiler[0] (one M tile); the caller dispatches on that.
+            sA_tma = storage.sA.get_tensor(
+                self.a_smem_layout_staged.outer,
+                swizzle=self.a_smem_layout_staged.inner,
+            )
+            gA_tma = cute.local_tile(
+                mA_mkl,
+                cute.slice_(self.tma_tiler, (None, 0, None)),
+                (None, None, None),
+            )
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sA_tma, 0, 3),
+                cute.group_modes(gA_tma, 0, 2),
+            )
+        else:
+            tAsA, tAgA = cpasync.tma_partition(
+                tma_atom_a,
+                block_in_cluster_coord_vmnk[2],
+                a_cta_layout,
+                cute.group_modes(sA, 0, 3),
+                cute.group_modes(tCgA, 0, 3),
+            )
         b_cta_layout = cute.make_layout(
             cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
         )
@@ -1948,6 +2016,7 @@ def compile(
     apply_norm: bool = True,
     cos_sin_row_floats: int = DEFAULT_COS_SIN_ROW_FLOATS,
     positions_int64: bool = True,
+    tma_tile: Tuple[int, int, int] | None = None,
 ):
     """Compile ONE handle serving every (M, N, K) problem shape.
 
@@ -1968,6 +2037,7 @@ def compile(
         tma_prefetch_dist=tma_prefetch_dist,
         apply_norm=apply_norm,
         cos_sin_row_floats=cos_sin_row_floats,
+        tma_tile=tma_tile,
     )
     key = (
         tuple(mma_inst_tile),
@@ -1981,6 +2051,7 @@ def compile(
         op.apply_norm,
         op.rope_cache_row_floats,
         bool(positions_int64),
+        op.tma_tiler,
     )
     if key in _COMPILE_CACHE:
         return _COMPILE_CACHE[key]

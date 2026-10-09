@@ -23,11 +23,23 @@ LAUNCH_CONFIGS = {
     "2cta_2x2": ((256, 256), (2, 2), (2, 1)),
     "2cta_4x2": ((256, 256), (4, 2), (2, 1)),
 }
-# (max tokens, launch config); the first bound that holds wins and the last entry
-# (bound None) takes everything larger. Measured on V4.1-Flash: 4x2 runs up to
-# ~2x slower than 2x1 while the activation is under 128 KiB, and 2x1 is ~10%
-# slower at 16k tokens. Re-tune with test/manual/kernels/bench_dsv4_q_b_sm107.py.
-_DEFAULT_LAUNCH_BY_TOKENS = ((256, "2cta_2x1"), (None, "2cta_4x2"))
+# (min N, max tokens, launch config); the first entry whose bounds hold wins, and
+# the last entry takes everything else. Measured on SM107: 2cta_2x1 is best or
+# within run-to-run noise for V4.1-Flash at TP4 and TP2 at every token count. At
+# N = 65536 (V4-Pro, 128 local heads) 1cta_1x1 is 14-36% faster up to 128 tokens:
+# 2-CTA launches stall while the activation is under 128 KiB, single-CTA does not.
+# Re-tune with test/manual/kernels/bench_dsv4_q_b_sm107.py.
+_DEFAULT_LAUNCH = (
+    (65536, 128, "1cta_1x1"),
+    (0, None, "2cta_2x1"),
+)
+# 1cta_1x1 at <= _SUB_TILE_MAX_TOKENS tokens shrinks the activation's TMA box to
+# the next power of two rows (kernel tma_tile; a handle serves only M <= its box).
+# The kernel author measured 6-17% faster at <= 32 tokens and 1.6% at 64 on R100
+# at N = 65536, and no gain at 128.
+_SUB_TILE_MAX_TOKENS = 64
+# Arbitrary floor that bounds the number of compiled handles.
+_SUB_TILE_MIN_ROWS = 8
 
 HEAD_DIM = 512
 # Floats per position row of torch.view_as_real(freqs_cis): 32 (cos, sin) pairs.
@@ -46,21 +58,34 @@ def is_dsv4_q_b_fused_available() -> bool:
     return True
 
 
-def _default_launch_config(num_tokens: int) -> str:
-    for max_tokens, launch_config in _DEFAULT_LAUNCH_BY_TOKENS[:-1]:
-        if num_tokens <= max_tokens:
+def _default_launch_config(num_tokens: int, n: int) -> str:
+    for min_n, max_tokens, launch_config in _DEFAULT_LAUNCH[:-1]:
+        if n >= min_n and num_tokens <= max_tokens:
             return launch_config
-    return _DEFAULT_LAUNCH_BY_TOKENS[-1][1]
+    return _DEFAULT_LAUNCH[-1][2]
+
+
+def _sub_tile_rows(launch_config: str, num_tokens: int) -> Optional[int]:
+    if launch_config != "1cta_1x1" or num_tokens > _SUB_TILE_MAX_TOKENS:
+        return None
+    return max(_SUB_TILE_MIN_ROWS, 1 << (num_tokens - 1).bit_length())
 
 
 @functools.cache
-def _compiled_kernel(*, launch_config: str, apply_norm: bool, positions_int64: bool):
+def _compiled_kernel(
+    *,
+    launch_config: str,
+    apply_norm: bool,
+    positions_int64: bool,
+    sub_tile_rows: Optional[int] = None,
+):
     # Cached here: kernel.compile builds the kernel object before its own cache lookup.
     from .kernel import compile as compile_kernel
 
     mma_inst_tile, cluster_shape_mn, fallback_cluster_shape_mn = LAUNCH_CONFIGS[
         launch_config
     ]
+    tma_tile = None if sub_tile_rows is None else (sub_tile_rows, 512, 128)
     return compile_kernel(
         mma_inst_tile=mma_inst_tile,
         cluster_shape_mn=cluster_shape_mn,
@@ -72,6 +97,7 @@ def _compiled_kernel(*, launch_config: str, apply_norm: bool, positions_int64: b
         apply_norm=apply_norm,
         cos_sin_row_floats=COS_SIN_ROW_FLOATS,
         positions_int64=positions_int64,
+        tma_tile=tma_tile,
     )
 
 
@@ -84,17 +110,28 @@ def _unit_quant_scale(device_index: int) -> torch.Tensor:
 def precompile_dsv4_q_b_fused(
     *,
     device: torch.device,
+    n: int,
     apply_norm: bool,
     positions_dtype: torch.dtype = torch.int64,
 ) -> None:
-    """Compile the default launch configs and allocate the kernel's constants
-    before CUDA graph capture."""
-    for _, launch_config in _DEFAULT_LAUNCH_BY_TOKENS:
-        _compiled_kernel(
-            launch_config=launch_config,
-            apply_norm=apply_norm,
-            positions_int64=positions_dtype == torch.int64,
-        )
+    """Compile the default launch configs for an N-wide weight and allocate the
+    kernel's constants before CUDA graph capture."""
+    for min_n, _, launch_config in _DEFAULT_LAUNCH:
+        if n < min_n:
+            continue
+        sub_tiles = {None}
+        if launch_config == "1cta_1x1":
+            sub_tiles |= {
+                _sub_tile_rows(launch_config, m)
+                for m in range(1, _SUB_TILE_MAX_TOKENS + 1)
+            }
+        for sub_tile_rows in sub_tiles:
+            _compiled_kernel(
+                launch_config=launch_config,
+                apply_norm=apply_norm,
+                positions_int64=positions_dtype == torch.int64,
+                sub_tile_rows=sub_tile_rows,
+            )
     device = torch.device(device)
     _unit_quant_scale(
         torch.cuda.current_device() if device.index is None else device.index
@@ -163,7 +200,7 @@ def dsv4_q_b_gemm_fused(
     elif not out.is_contiguous():
         raise ValueError("out must be contiguous")
     if launch_config is None:
-        launch_config = _default_launch_config(m)
+        launch_config = _default_launch_config(m, n)
     elif launch_config not in LAUNCH_CONFIGS:
         raise ValueError(
             f"unknown launch_config {launch_config!r}; one of {list(LAUNCH_CONFIGS)}"
@@ -175,6 +212,7 @@ def dsv4_q_b_gemm_fused(
         launch_config=launch_config,
         apply_norm=eps is not None,
         positions_int64=positions.dtype == torch.int64,
+        sub_tile_rows=_sub_tile_rows(launch_config, m),
     )
 
     def tvm_tensor(tensor: torch.Tensor, alignment: int = 16):

@@ -3,7 +3,9 @@ with --dsv4-attn-backend trtllm: FlashInfer MXFP8 GEMM (bf16 out), then
 fused_q_norm_rope into an FP8 Q (bf16 temp + cast). Both start from the same
 MXFP8 q_lora. Timed under CUDA graphs with rotated input copies (cold L2).
 
-Use the "best" column to set _DEFAULT_LAUNCH_BY_TOKENS in
+The 1cta_1x1 column includes its sub-tile TMA box at <= 64 tokens.
+
+Use the "best" column to set _DEFAULT_LAUNCH in
 sglang/kernels/ops/gemm/dsv4_q_b_sm107/__init__.py, and the speedup of the best
 config to set SGLANG_OPT_DSV4_FUSED_Q_B_SM107_MIN_TOKENS.
 
@@ -95,7 +97,7 @@ def _bench_shape(name, k, heads, eps):
         )
         print(
             f"{row} {best:>9} {t_unfused / times[best]:>7.2f}x "
-            f"{_default_launch_config(m):>9}"
+            f"{_default_launch_config(m, n):>9}"
         )
 
 

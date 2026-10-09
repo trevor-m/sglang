@@ -167,6 +167,32 @@ def test_every_launch_config_matches_reference(model, launch_config):
 
 
 @pytest.mark.parametrize("model", list(MODELS))
+def test_1cta_sub_tile_boundaries_match_reference(model):
+    """1cta_1x1 under 65 tokens loads the activation through a TMA box of the next
+    power of two rows (at least 8), and each box may only serve M up to its size;
+    these M sit on both sides of every box edge."""
+    k, block, eps = MODELS[model]
+    w_q, w_sf, w = _weight(k, block)
+    freqs_cis = precompute_freqs_cis(64, MAX_POSITION, 0, 10000, 1.0, 32, 1).to(DEVICE)
+    for m in (1, 8, 9, 16, 17, 32, 33, 64, 65):
+        torch.manual_seed(m)
+        a_q, a_sf, a = _activation(m, k, "torch")
+        positions = torch.randint(0, MAX_POSITION, (m,), device=DEVICE)
+        out = dsv4_q_b_gemm_fused(
+            a_q,
+            a_sf,
+            w_q,
+            w_sf,
+            freqs_cis,
+            positions,
+            eps=eps,
+            launch_config="1cta_1x1",
+        )
+        torch.cuda.synchronize()
+        _assert_close(out, _reference(a, w, freqs_cis, positions, eps))
+
+
+@pytest.mark.parametrize("model", list(MODELS))
 def test_cuda_graph_replay_matches_eager(model):
     k, block, eps = MODELS[model]
     m = 8

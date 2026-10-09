@@ -125,7 +125,9 @@ def prepare_fused_q_b(
             layer_id,
         )
         return None
-    precompile_dsv4_q_b_fused(device=wq_b.weight.device, apply_norm=apply_norm)
+    precompile_dsv4_q_b_fused(
+        device=wq_b.weight.device, n=wq_b.weight.shape[0], apply_norm=apply_norm
+    )
     return scale
 
 

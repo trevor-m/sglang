@@ -180,17 +180,21 @@ class NgramEmbeddingManager:
             rows = []
             for req in batch.reqs:
                 # full_untruncated_fill_ids is only refreshed on the extend and
-                # decode paths, which a PD decode request has not run yet.
-                fill_ids = req.origin_input_ids + req.output_ids
-                end = len(fill_ids) - 1
-                ids = fill_ids[max(0, end - n1) : end]
+                # decode paths, which a PD decode request has not run yet. Only
+                # the last n tokens of prompt + output are needed: slicing the
+                # tail avoids copying a ~100k-token prompt per admission.
+                tail = (req.origin_input_ids[-(n1 + 1) :] + req.output_ids)[-(n1 + 1) :]
+                ids = tail[:-1]
                 rows.append([0] * (n1 - len(ids)) + list(ids))
-            slots = torch.tensor(
+            # Pinned, stream-ordered copies: a pageable torch.tensor(device=)
+            # synchronizes the schedule stream, which waits for the in-flight
+            # forward on every admitting iteration.
+            slots = async_h2d(
                 [req.kv.req_pool_idx for req in batch.reqs],
                 dtype=torch.int64,
                 device=history.device,
             )
-            history[slots] = torch.tensor(
+            history[slots] = async_h2d(
                 rows, dtype=history.dtype, device=history.device
             ).view(len(rows), n1)
             return

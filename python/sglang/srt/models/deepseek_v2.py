@@ -1018,15 +1018,21 @@ class DeepseekV2MoE(nn.Module):
         num_local_experts_for_eplb = (
             self.experts.num_local_experts - self.num_fused_shared_experts
         )
+        # MegaMoE localized weights are (num_domains, E, N / num_domains, K):
+        # EPLB moves each domain's slab as its own tensor (mega_moe.py).
+        localized = getattr(self.experts, "_mega_moe_localized_params", ())
 
-        return [
-            x.data[:num_local_experts_for_eplb]
-            for name, x in self.experts.named_parameters()
-            if name not in ["correction_bias"]
-            and filter_moe_weight_param_global_expert(
+        weights = []
+        for name, x in self.experts.named_parameters():
+            if name in ["correction_bias"]:
+                continue
+            if name in localized:
+                weights += [s[:num_local_experts_for_eplb] for s in x.data.unbind(0)]
+            elif filter_moe_weight_param_global_expert(
                 name, x, self.experts.num_local_experts
-            )
-        ]
+            ):
+                weights.append(x.data[:num_local_experts_for_eplb])
+        return weights
 
     def _can_dual_stream_graph(self, hidden_states: torch.Tensor) -> bool:
         return (

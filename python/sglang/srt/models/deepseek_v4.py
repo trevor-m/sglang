@@ -4717,13 +4717,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         get_attn_tp_context().init_context(config.q_lora_rank, is_dsa=True)
 
         self._routed_experts_weights_of_layer = LazyValue(
-            lambda: {
-                layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
-                for layer_id in range(self.model.start_layer, self.model.end_layer)
-                if isinstance(
-                    self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE
-                )
-            }
+            self._collect_routed_experts_weights_of_layer
         )
 
         # Expose start_layer/end_layer for model_runner PP support
@@ -4791,6 +4785,13 @@ class DeepseekV4ForCausalLM(nn.Module):
                 num_tokens,
             )
         return len(seen)
+
+    def _collect_routed_experts_weights_of_layer(self):
+        return {
+            layer_id: self.model.layers[layer_id].mlp.get_moe_weights()
+            for layer_id in range(self.model.start_layer, self.model.end_layer)
+            if isinstance(self.model.layers[layer_id].mlp, deepseek_v2.DeepseekV2MoE)
+        }
 
     @property
     def routed_experts_weights_of_layer(self):
@@ -5085,6 +5086,7 @@ class DeepseekV4ForCausalLM(nn.Module):
     def precompile_kernels_after_loading(self) -> None:
         from sglang.srt.layers.moe.mega_moe import (
             build_mega_moe_shared_weights,
+            localize_mega_moe_weights,
             should_fuse_mega_moe_shared_experts,
         )
 
@@ -5104,6 +5106,15 @@ class DeepseekV4ForCausalLM(nn.Module):
                 module.mega_shared_l1_weights, module.mega_shared_l2_weights = (
                     build_mega_moe_shared_weights(module.shared_experts)
                 )
+
+        # After the shared weights: DeepGEMM localizes routed and shared together.
+        if localize_mega_moe_weights(self) and hasattr(
+            self, "_collect_routed_experts_weights_of_layer"
+        ):
+            # EPLB must move the localized tensors: drop any list built earlier.
+            self._routed_experts_weights_of_layer = LazyValue(
+                self._collect_routed_experts_weights_of_layer
+            )
 
     @staticmethod
     def remap_weight_name_to_dpsk_hf_format(

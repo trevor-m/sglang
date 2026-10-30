@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import functools
+import logging
 from contextlib import contextmanager, nullcontext
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
@@ -42,6 +43,8 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
 
+
+logger = logging.getLogger(__name__)
 
 _MEGA_MOE_SYMM_BUFFER: dict = {}
 _is_hip = is_hip()
@@ -190,7 +193,163 @@ def should_use_mega_moe(moe: DeepseekV2MoE, hidden_states: torch.Tensor) -> bool
     else:
         max_tokens_per_rank = hidden_states.shape[0]
     cap = envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
-    return max_tokens_per_rank <= cap
+    if max_tokens_per_rank <= cap:
+        return True
+    if is_mega_moe_localized(moe.experts):
+        raise RuntimeError(
+            f"MegaMoE: a rank has {max_tokens_per_rank} tokens, over "
+            f"SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK={cap}, and the "
+            "DeepEP fallback cannot read the localized expert weights. Raise the cap "
+            "or unset SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE_WEIGHTS."
+        )
+    return False
+
+
+def is_mega_moe_localized(experts) -> bool:
+    return getattr(experts, "_mega_moe_localized", False)
+
+
+def _mega_moe_localize_refusal(moes) -> Optional[str]:
+    """Why this rank cannot localize its MegaMoE weights, or None."""
+    from sglang.srt.runtime_context import get_disagg, get_exec
+
+    if _use_amd_flydsl_mega_moe() or _device_sm // 10 != 10:
+        return "it needs an SM100-family GPU"
+    if not (
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE_ANY_MODE.get()
+        or get_disagg().disaggregation_mode == "decode"
+    ):
+        return "only PD decode workers run every MoE forward through MegaMoE"
+    if get_exec().moe.elastic_ep_backend:
+        return "elastic EP reloads lost experts in the ordinary layout"
+    try:
+        import deep_gemm
+    except ImportError:
+        return "DeepGEMM is not installed"
+    if not all(
+        callable(getattr(deep_gemm, name, None))
+        for name in (
+            "localize",
+            "destroy_localizer",
+            "is_localization_available",
+            "get_num_locality_domains",
+        )
+    ):
+        return "DeepGEMM has no locality-domain API (sgl-deep-gemm >= 0.2.5)"
+    if not deep_gemm.is_localization_available():
+        return "the GPU or driver offers no localized memory"
+    num_domains = deep_gemm.get_num_locality_domains()
+    if num_domains < 2:
+        return f"the GPU has {num_domains} locality domain"
+    for moe in moes:
+        experts = moe.experts
+        if _mega_moe_mma_type(experts) != "fp8xfp4" or experts._mega_moe_trtllm_layout:
+            return f"MMA type {_mega_moe_mma_type(experts)} is not supported"
+        weights = [experts.mega_l1_weights[0], experts.mega_l2_weights[0]]
+        if moe.mega_shared_l1_weights is not None:
+            weights += [moe.mega_shared_l1_weights[0], moe.mega_shared_l2_weights[0]]
+        if any(w.shape[-2] % num_domains for w in weights):
+            return f"a weight's N does not split into {num_domains} domains"
+    return None
+
+
+def _all_ranks_agree(ok: bool) -> bool:
+    from sglang.srt.runtime_context import get_parallel
+
+    if not torch.distributed.is_initialized():
+        return ok
+    group = get_parallel().moe_ep_group
+    if group.world_size == 1:
+        return ok
+    flag = torch.tensor([int(ok)], dtype=torch.int32, device="cpu")
+    torch.distributed.all_reduce(
+        flag, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+    )
+    return bool(flag.item())
+
+
+def _localize_mega_moe_layer(deep_gemm, moe: DeepseekV2MoE) -> None:
+    experts = moe.experts
+    # The routed tuples alias the expert parameters, so repointing both releases
+    # the routed originals. The shared L2 aliases shared_experts.down_proj.weight,
+    # which keeps its original.
+    assert experts.mega_l1_weights[0].data_ptr() == experts.w13_weight.data_ptr()
+    assert experts.mega_l2_weights[0].data_ptr() == experts.w2_weight.data_ptr()
+    # Copy the whole layer before repointing anything: DeepGEMM requires routed
+    # and shared weights to be either all localized or none.
+    l1 = deep_gemm.localize(experts.mega_l1_weights[0])
+    l2 = deep_gemm.localize(experts.mega_l2_weights[0])
+    shared = None
+    if moe.mega_shared_l1_weights is not None:
+        shared_l1, shared_l2 = moe.mega_shared_l1_weights, moe.mega_shared_l2_weights
+        shared = (
+            (deep_gemm.localize(shared_l1[0]), shared_l1[1]),
+            (deep_gemm.localize(shared_l2[0]), shared_l2[1]),
+        )
+
+    experts.w13_weight.data = l1
+    experts.w2_weight.data = l2
+    experts.mega_l1_weights = (l1, experts.mega_l1_weights[1])
+    experts.mega_l2_weights = (l2, experts.mega_l2_weights[1])
+    if shared is not None:
+        moe.mega_shared_l1_weights, moe.mega_shared_l2_weights = shared
+    # These parameters are now (num_domains, E, N / num_domains, K): dim 0 is
+    # the locality domain, so EPLB moves each domain's slab (get_moe_weights).
+    experts._mega_moe_localized_params = ("w13_weight", "w2_weight")
+    experts._mega_moe_localized = True
+
+
+def localize_mega_moe_weights(model: torch.nn.Module) -> bool:
+    """Copy the MegaMoE expert weights into the GPU's locality domains.
+
+    deep_gemm.localize() splits each weight's N rows across the domains, slab d
+    in domain d's memory, and the MegaMoE scheduler gives domain d's SMs exactly
+    those rows, so the kernel's weight reads stay on their die. Only the MegaMoE
+    kernel reads that layout: should_use_mega_moe raises instead of falling back
+    to DeepEP. Runs after the MegaMoE weights are built and before graph capture;
+    every rank takes the same decision. Returns whether the weights moved.
+    """
+    if not envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE_WEIGHTS.get():
+        return False
+    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+    moes = [
+        m
+        for m in model.modules()
+        if isinstance(m, DeepseekV2MoE)
+        and getattr(m.experts, "_mega_moe_weights_built", False)
+        and not is_mega_moe_localized(m.experts)
+    ]
+    if not moes:
+        return False
+    refusal = _mega_moe_localize_refusal(moes)
+    if not _all_ranks_agree(refusal is None):
+        logger.warning(
+            "MegaMoE: not localizing the expert weights: %s",
+            refusal or "another rank cannot",
+        )
+        return False
+
+    import deep_gemm
+
+    try:
+        for moe in moes:
+            _localize_mega_moe_layer(deep_gemm, moe)
+            # The originals return to PyTorch's cache, but the next layer's copy
+            # comes from the driver (cuMemCreate): release them now, or the peak
+            # holds every expert weight twice.
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+    finally:
+        deep_gemm.destroy_localizer()
+    logger.info(
+        "MegaMoE: localized the expert weights of %d MoE layers into %d locality "
+        "domains (token cap %d/rank)",
+        len(moes),
+        deep_gemm.get_num_locality_domains(),
+        envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get(),
+    )
+    return True
 
 
 def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:

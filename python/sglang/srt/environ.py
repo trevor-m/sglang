@@ -1514,6 +1514,15 @@ class Envs:
     # residency margin so every cluster can launch beside other streams.
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_FUSE_SHARED_EXPERTS = EnvBool(True)
+    # Copy the routed and fused shared expert weights into the GPU's locality
+    # domains after loading (DeepGEMM localize), so each die's SMs read their
+    # half of every expert from local memory. PD decode workers only: the
+    # DeepEP fallback above the token cap cannot read the localized layout, so
+    # a batch over the cap raises instead.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE_WEIGHTS = EnvBool(False)
+    # Testing: also localize outside PD decode workers (every forward must then
+    # fit SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK).
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE_ANY_MODE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
 
     # ===================================================================
